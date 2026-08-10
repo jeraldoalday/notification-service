@@ -1,0 +1,23 @@
+# Example configuration for the notification service.
+# Copy to config/local.toml (gitignored) and adjust for your environment.
+# Any value here can also be overridden by an NS_* environment variable
+# at runtime -- see crates/config/src/loader.rs for the full list.
+
+[server]
+host = "127.0.0.1"
+port = 8080
+
+[database]
+url = "sqlite://notifications.db"
+max_connections = 10
+
+[queue]
+poll_interval_ms = 500
+batch_size = 25
+max_retry_attempts = 5
+
+[smtp]
+host = "localhost"
+port = 587
+username = ""
+from_address = "notifications@example.com"
