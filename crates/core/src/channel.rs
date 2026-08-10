@@ -22,12 +22,7 @@ impl ChannelKind {
     }
 
     pub fn all() -> [ChannelKind; 4] {
-        [
-            ChannelKind::Email,
-            ChannelKind::Sms,
-            ChannelKind::Push,
-            ChannelKind::Webhook,
-        ]
+        [ChannelKind::Email, ChannelKind::Sms, ChannelKind::Push, ChannelKind::Webhook]
     }
 }
 

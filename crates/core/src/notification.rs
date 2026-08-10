@@ -174,9 +174,8 @@ mod tests {
 
     #[test]
     fn builder_requires_body_or_template() {
-        let err = Notification::builder(Uuid::new_v4(), Uuid::new_v4(), ChannelKind::Sms)
-            .build()
-            .unwrap_err();
+        let err =
+            Notification::builder(Uuid::new_v4(), Uuid::new_v4(), ChannelKind::Sms).build().unwrap_err();
         assert!(matches!(err, CoreError::Validation(_)));
     }
 

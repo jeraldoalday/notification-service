@@ -2,19 +2,14 @@ use serde::{Deserialize, Serialize};
 
 /// Delivery priority. Higher-priority notifications are dequeued first by
 /// the worker's scheduler (see `ns-queue`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Priority {
     Low = 0,
+    #[default]
     Normal = 1,
     High = 2,
     Critical = 3,
-}
-
-impl Default for Priority {
-    fn default() -> Self {
-        Priority::Normal
-    }
 }
 
 impl Priority {
@@ -43,9 +38,6 @@ mod tests {
     fn sorts_descending_for_dequeue() {
         let mut priorities = vec![Priority::Low, Priority::Critical, Priority::Normal, Priority::High];
         priorities.sort_by(|a, b| b.cmp(a));
-        assert_eq!(
-            priorities,
-            vec![Priority::Critical, Priority::High, Priority::Normal, Priority::Low]
-        );
+        assert_eq!(priorities, vec![Priority::Critical, Priority::High, Priority::Normal, Priority::Low]);
     }
 }

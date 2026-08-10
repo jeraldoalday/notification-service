@@ -11,10 +11,7 @@ pub enum CoreError {
     MissingAddress(crate::channel::ChannelKind),
 
     #[error("invalid state transition: cannot move from {from:?} to {to:?}")]
-    InvalidTransition {
-        from: crate::status::DeliveryStatus,
-        to: crate::status::DeliveryStatus,
-    },
+    InvalidTransition { from: crate::status::DeliveryStatus, to: crate::status::DeliveryStatus },
 
     #[error("serialization error: {0}")]
     Serialization(#[from] serde_json::Error),

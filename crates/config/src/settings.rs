@@ -1,23 +1,12 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     pub server: ServerSettings,
     pub database: DatabaseSettings,
     pub queue: QueueSettings,
     pub smtp: SmtpSettings,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            server: ServerSettings::default(),
-            database: DatabaseSettings::default(),
-            queue: QueueSettings::default(),
-            smtp: SmtpSettings::default(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -29,10 +18,7 @@ pub struct ServerSettings {
 
 impl Default for ServerSettings {
     fn default() -> Self {
-        Self {
-            host: "127.0.0.1".to_string(),
-            port: 8080,
-        }
+        Self { host: "127.0.0.1".to_string(), port: 8080 }
     }
 }
 
@@ -45,10 +31,7 @@ pub struct DatabaseSettings {
 
 impl Default for DatabaseSettings {
     fn default() -> Self {
-        Self {
-            url: "sqlite://notifications.db".to_string(),
-            max_connections: 10,
-        }
+        Self { url: "sqlite://notifications.db".to_string(), max_connections: 10 }
     }
 }
 
@@ -62,11 +45,7 @@ pub struct QueueSettings {
 
 impl Default for QueueSettings {
     fn default() -> Self {
-        Self {
-            poll_interval_ms: 500,
-            batch_size: 25,
-            max_retry_attempts: 5,
-        }
+        Self { poll_interval_ms: 500, batch_size: 25, max_retry_attempts: 5 }
     }
 }
 

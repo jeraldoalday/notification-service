@@ -42,9 +42,7 @@ impl RecipientAddress {
                 if number.starts_with('+') && digits_only.len() >= 8 && digits_only.len() <= 15 {
                     Ok(())
                 } else {
-                    Err(CoreError::Validation(format!(
-                        "phone number must be E.164 formatted: {number}"
-                    )))
+                    Err(CoreError::Validation(format!("phone number must be E.164 formatted: {number}")))
                 }
             }
             RecipientAddress::PushToken(token) => {
@@ -76,11 +74,7 @@ pub struct Recipient {
 
 impl Recipient {
     pub fn new(id: Uuid) -> Self {
-        Self {
-            id,
-            display_name: None,
-            addresses: HashMap::new(),
-        }
+        Self { id, display_name: None, addresses: HashMap::new() }
     }
 
     pub fn with_display_name(mut self, name: impl Into<String>) -> Self {
@@ -95,9 +89,7 @@ impl Recipient {
     }
 
     pub fn address_for(&self, channel: ChannelKind) -> CoreResult<&RecipientAddress> {
-        self.addresses
-            .get(&channel)
-            .ok_or(CoreError::MissingAddress(channel))
+        self.addresses.get(&channel).ok_or(CoreError::MissingAddress(channel))
     }
 
     pub fn supports(&self, channel: ChannelKind) -> bool {
@@ -163,9 +155,7 @@ mod tests {
     #[test]
     fn webhook_requires_scheme() {
         assert!(RecipientAddress::WebhookUrl("example.com/hook".into()).validate().is_err());
-        assert!(RecipientAddress::WebhookUrl("https://example.com/hook".into())
-            .validate()
-            .is_ok());
+        assert!(RecipientAddress::WebhookUrl("https://example.com/hook".into()).validate().is_ok());
     }
 
     #[test]

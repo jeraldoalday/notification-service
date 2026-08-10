@@ -12,10 +12,7 @@ pub fn load_from_file(path: impl AsRef<Path>) -> Result<Settings, ConfigError> {
     match std::fs::read_to_string(path) {
         Ok(contents) => Ok(toml::from_str(&contents)?),
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(Settings::default()),
-        Err(err) => Err(ConfigError::Io {
-            path: path.display().to_string(),
-            source: err,
-        }),
+        Err(err) => Err(ConfigError::Io { path: path.display().to_string(), source: err }),
     }
 }
 
@@ -29,7 +26,10 @@ pub fn load_from_file(path: impl AsRef<Path>) -> Result<Settings, ConfigError> {
 /// `NS_QUEUE_BATCH_SIZE`, `NS_SMTP_HOST`, `NS_SMTP_PORT`, `NS_SMTP_USERNAME`.
 /// Unrecognized keys are ignored so callers can pass through the full
 /// process environment safely.
-pub fn apply_overrides(mut settings: Settings, overrides: &HashMap<String, String>) -> Result<Settings, ConfigError> {
+pub fn apply_overrides(
+    mut settings: Settings,
+    overrides: &HashMap<String, String>,
+) -> Result<Settings, ConfigError> {
     macro_rules! parse_override {
         ($key:expr, $target:expr) => {
             if let Some(raw) = overrides.get($key) {
