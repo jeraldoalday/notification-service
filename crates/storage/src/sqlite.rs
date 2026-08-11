@@ -165,3 +165,166 @@ impl RecipientRepository for SqliteStorage {
         Ok(serde_json::from_str(&data)?)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration;
+    use ns_core::{ChannelKind, DeliveryStatus, Priority, Recipient, RecipientAddress};
+
+    /// Each test gets its own on-disk SQLite file rather than
+    /// `sqlite::memory:`, since a pooled connection to `:memory:` gives
+    /// every connection its own separate database once the pool grows
+    /// past one connection -- writes from one connection wouldn't be
+    /// visible to reads from another.
+    async fn test_storage() -> (SqliteStorage, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::connect(&format!("sqlite://{}", db_path.display())).await.unwrap();
+        (storage, dir)
+    }
+
+    fn sample_notification() -> Notification {
+        Notification::builder(Uuid::new_v4(), Uuid::new_v4(), ChannelKind::Email)
+            .subject("Welcome")
+            .body("Hello there")
+            .build()
+            .unwrap()
+    }
+
+    fn sample_recipient() -> Recipient {
+        Recipient::new(Uuid::new_v4())
+            .with_display_name("Ada Lovelace")
+            .with_address(RecipientAddress::Email("ada@example.com".into()))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn inserts_and_gets_notification() {
+        let (storage, _dir) = test_storage().await;
+        let notification = sample_notification();
+
+        storage.insert_notification(&notification).await.unwrap();
+        let fetched = storage.get_notification(notification.id).await.unwrap();
+
+        assert_eq!(fetched.id, notification.id);
+        assert_eq!(fetched.body, notification.body);
+        assert_eq!(fetched.status, DeliveryStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn get_missing_notification_errors() {
+        let (storage, _dir) = test_storage().await;
+        let err = storage.get_notification(Uuid::new_v4()).await.unwrap_err();
+        assert!(matches!(err, StorageError::NotificationNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn update_persists_transitioned_status() {
+        let (storage, _dir) = test_storage().await;
+        let mut notification = sample_notification();
+        storage.insert_notification(&notification).await.unwrap();
+
+        notification.transition(DeliveryStatus::Queued, Utc::now()).unwrap();
+        storage.update_notification(&notification).await.unwrap();
+
+        let fetched = storage.get_notification(notification.id).await.unwrap();
+        assert_eq!(fetched.status, DeliveryStatus::Queued);
+    }
+
+    #[tokio::test]
+    async fn update_missing_notification_errors() {
+        let (storage, _dir) = test_storage().await;
+        let err = storage.update_notification(&sample_notification()).await.unwrap_err();
+        assert!(matches!(err, StorageError::NotificationNotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn due_for_delivery_filters_by_status_and_schedule() {
+        let (storage, _dir) = test_storage().await;
+        let now = Utc::now();
+
+        let still_pending = sample_notification();
+        storage.insert_notification(&still_pending).await.unwrap();
+
+        let mut queued_future = sample_notification();
+        queued_future.transition(DeliveryStatus::Queued, now).unwrap();
+        queued_future.scheduled_for = Some(now + Duration::hours(1));
+        storage.insert_notification(&queued_future).await.unwrap();
+
+        let mut queued_due = sample_notification();
+        queued_due.transition(DeliveryStatus::Queued, now).unwrap();
+        queued_due.scheduled_for = Some(now - Duration::minutes(1));
+        storage.insert_notification(&queued_due).await.unwrap();
+
+        let due = storage.due_for_delivery(now, 10).await.unwrap();
+        let due_ids: Vec<Uuid> = due.iter().map(|n| n.id).collect();
+
+        assert_eq!(due_ids, vec![queued_due.id]);
+    }
+
+    #[tokio::test]
+    async fn due_for_delivery_orders_by_priority_then_age() {
+        let (storage, _dir) = test_storage().await;
+        let now = Utc::now();
+
+        let mut low = Notification::builder(Uuid::new_v4(), Uuid::new_v4(), ChannelKind::Email)
+            .body("low")
+            .priority(Priority::Low)
+            .build()
+            .unwrap();
+        low.transition(DeliveryStatus::Queued, now).unwrap();
+
+        let mut critical = Notification::builder(Uuid::new_v4(), Uuid::new_v4(), ChannelKind::Email)
+            .body("critical")
+            .priority(Priority::Critical)
+            .build()
+            .unwrap();
+        critical.transition(DeliveryStatus::Queued, now).unwrap();
+
+        // Insert low-priority first so, absent priority ordering, it would
+        // sort first by created_at too -- this proves priority wins.
+        storage.insert_notification(&low).await.unwrap();
+        storage.insert_notification(&critical).await.unwrap();
+
+        let due = storage.due_for_delivery(now, 10).await.unwrap();
+        let due_ids: Vec<Uuid> = due.iter().map(|n| n.id).collect();
+
+        assert_eq!(due_ids, vec![critical.id, low.id]);
+    }
+
+    #[tokio::test]
+    async fn due_for_delivery_respects_limit() {
+        let (storage, _dir) = test_storage().await;
+        let now = Utc::now();
+
+        for _ in 0..3 {
+            let mut n = sample_notification();
+            n.transition(DeliveryStatus::Queued, now).unwrap();
+            storage.insert_notification(&n).await.unwrap();
+        }
+
+        let due = storage.due_for_delivery(now, 2).await.unwrap();
+        assert_eq!(due.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn inserts_and_gets_recipient() {
+        let (storage, _dir) = test_storage().await;
+        let recipient = sample_recipient();
+
+        storage.insert_recipient(&recipient).await.unwrap();
+        let fetched = storage.get_recipient(recipient.id).await.unwrap();
+
+        assert_eq!(fetched.id, recipient.id);
+        assert_eq!(fetched.display_name.as_deref(), Some("Ada Lovelace"));
+        assert!(fetched.supports(ChannelKind::Email));
+    }
+
+    #[tokio::test]
+    async fn get_missing_recipient_errors() {
+        let (storage, _dir) = test_storage().await;
+        let err = storage.get_recipient(Uuid::new_v4()).await.unwrap_err();
+        assert!(matches!(err, StorageError::RecipientNotFound(_)));
+    }
+}
