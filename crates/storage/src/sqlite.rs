@@ -142,3 +142,26 @@ impl NotificationRepository for SqliteStorage {
             .collect()
     }
 }
+
+#[async_trait]
+impl RecipientRepository for SqliteStorage {
+    async fn insert_recipient(&self, recipient: &Recipient) -> StorageResult<()> {
+        let data = serde_json::to_string(recipient)?;
+        sqlx::query("INSERT INTO recipients (id, data) VALUES (?, ?)")
+            .bind(recipient.id.to_string())
+            .bind(data)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn get_recipient(&self, id: Uuid) -> StorageResult<Recipient> {
+        let row = sqlx::query("SELECT data FROM recipients WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(StorageError::RecipientNotFound(id))?;
+        let data: String = row.try_get("data")?;
+        Ok(serde_json::from_str(&data)?)
+    }
+}
