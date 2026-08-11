@@ -63,3 +63,82 @@ fn status_str(status: DeliveryStatus) -> &'static str {
 fn to_ts(dt: DateTime<Utc>) -> String {
     dt.to_rfc3339_opts(SecondsFormat::Millis, true)
 }
+
+#[async_trait]
+impl NotificationRepository for SqliteStorage {
+    async fn insert_notification(&self, notification: &Notification) -> StorageResult<()> {
+        let data = serde_json::to_string(notification)?;
+        sqlx::query(
+            "INSERT INTO notifications
+                (id, tenant_id, status, priority, scheduled_for, created_at, updated_at, data)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(notification.id.to_string())
+        .bind(notification.tenant_id.to_string())
+        .bind(status_str(notification.status))
+        .bind(notification.priority.as_u8() as i64)
+        .bind(notification.scheduled_for.map(to_ts))
+        .bind(to_ts(notification.created_at))
+        .bind(to_ts(notification.updated_at))
+        .bind(data)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_notification(&self, id: Uuid) -> StorageResult<Notification> {
+        let row = sqlx::query("SELECT data FROM notifications WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(StorageError::NotificationNotFound(id))?;
+        let data: String = row.try_get("data")?;
+        Ok(serde_json::from_str(&data)?)
+    }
+
+    async fn update_notification(&self, notification: &Notification) -> StorageResult<()> {
+        let data = serde_json::to_string(notification)?;
+        let result = sqlx::query(
+            "UPDATE notifications
+             SET tenant_id = ?, status = ?, priority = ?, scheduled_for = ?,
+                 created_at = ?, updated_at = ?, data = ?
+             WHERE id = ?",
+        )
+        .bind(notification.tenant_id.to_string())
+        .bind(status_str(notification.status))
+        .bind(notification.priority.as_u8() as i64)
+        .bind(notification.scheduled_for.map(to_ts))
+        .bind(to_ts(notification.created_at))
+        .bind(to_ts(notification.updated_at))
+        .bind(data)
+        .bind(notification.id.to_string())
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(StorageError::NotificationNotFound(notification.id));
+        }
+        Ok(())
+    }
+
+    async fn due_for_delivery(&self, now: DateTime<Utc>, limit: u32) -> StorageResult<Vec<Notification>> {
+        let rows = sqlx::query(
+            "SELECT data FROM notifications
+             WHERE status = ? AND (scheduled_for IS NULL OR scheduled_for <= ?)
+             ORDER BY priority DESC, created_at ASC
+             LIMIT ?",
+        )
+        .bind(status_str(DeliveryStatus::Queued))
+        .bind(to_ts(now))
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let data: String = row.try_get("data")?;
+                Ok(serde_json::from_str(&data)?)
+            })
+            .collect()
+    }
+}
