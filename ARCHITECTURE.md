@@ -24,9 +24,15 @@ so each concern can be tested and evolved independently:
   keys at runtime. Deliberately takes an injectable map rather than reading
   `std::env` directly wherever overrides are applied, so the override logic
   is unit-testable without mutating global process state.
-- **`ns-storage`** (planned) -- a `Repository` trait with a SQLite
-  implementation (via `sqlx`) backing notifications, recipients, and
-  templates.
+- **`ns-storage`** -- `NotificationRepository` and `RecipientRepository`
+  traits with a SQLite implementation (via `sqlx`). Each entity is stored
+  as a full JSON document in a `data` column, alongside a handful of plain
+  columns (`status`, `priority`, `scheduled_for`, `tenant_id`) that exist
+  purely to make filtered queries efficient -- `due_for_delivery`, the
+  query the worker will poll on, is backed by an index over exactly those
+  columns. The JSON blob stays the single source of truth for the entity
+  itself, so adding a field to `Notification` or `Recipient` doesn't
+  require a matching column or migration.
 - **`ns-queue`** (planned) -- durable job queue on top of the storage
   layer: priority ordering, delayed/scheduled delivery, and dequeue-for-
   processing semantics.
@@ -67,7 +73,7 @@ This file is updated as each part lands. Currently implemented:
 
 - [x] Domain model (`ns-core`)
 - [x] Configuration loading (`ns-config`)
-- [ ] Storage layer
+- [x] Storage layer (`ns-storage`)
 - [ ] Job queue
 - [ ] Channel providers (email, SMS, push, webhook)
 - [ ] Rate limiting / circuit breaker
