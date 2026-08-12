@@ -354,4 +354,44 @@ mod tests {
         let err = storage.get_recipient(Uuid::new_v4()).await.unwrap_err();
         assert!(matches!(err, StorageError::RecipientNotFound(_)));
     }
+
+    #[tokio::test]
+    async fn try_update_succeeds_when_status_matches() {
+        let (storage, _dir) = test_storage().await;
+        let mut notification = sample_notification();
+        storage.insert_notification(&notification).await.unwrap();
+
+        notification.transition(DeliveryStatus::Queued, Utc::now()).unwrap();
+        let won = storage.try_update_notification(&notification, DeliveryStatus::Pending).await.unwrap();
+
+        assert!(won);
+        let fetched = storage.get_notification(notification.id).await.unwrap();
+        assert_eq!(fetched.status, DeliveryStatus::Queued);
+    }
+
+    #[tokio::test]
+    async fn try_update_loses_race_when_status_has_moved_on() {
+        let (storage, _dir) = test_storage().await;
+        let mut notification = sample_notification();
+        storage.insert_notification(&notification).await.unwrap();
+
+        // Simulate another worker having already claimed this notification.
+        notification.transition(DeliveryStatus::Queued, Utc::now()).unwrap();
+        storage.update_notification(&notification).await.unwrap();
+
+        // This caller still thinks the notification is Pending and tries to
+        // claim it on that basis -- it should lose, and leave the row alone.
+        let stale_claim = sample_notification_with_id(notification.id);
+        let won = storage.try_update_notification(&stale_claim, DeliveryStatus::Pending).await.unwrap();
+
+        assert!(!won);
+        let fetched = storage.get_notification(notification.id).await.unwrap();
+        assert_eq!(fetched.status, DeliveryStatus::Queued);
+    }
+
+    fn sample_notification_with_id(id: Uuid) -> Notification {
+        let mut n = sample_notification();
+        n.id = id;
+        n
+    }
 }
