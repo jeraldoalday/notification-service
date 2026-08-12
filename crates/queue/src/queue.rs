@@ -2,6 +2,7 @@ use chrono::{DateTime, Utc};
 use ns_core::{DeliveryStatus, Notification};
 use ns_storage::NotificationRepository;
 
+use crate::backoff;
 use crate::error::QueueResult;
 
 /// Durable job queue built on top of a `NotificationRepository`: submitting
@@ -51,5 +52,39 @@ impl<R: NotificationRepository> NotificationQueue<R> {
         }
 
         Ok(claimed)
+    }
+
+    /// Marks a `Sending` notification `Delivered`.
+    pub async fn complete(
+        &self,
+        mut notification: Notification,
+        now: DateTime<Utc>,
+    ) -> QueueResult<Notification> {
+        notification.transition(DeliveryStatus::Delivered, now)?;
+        self.repo.update_notification(&notification).await?;
+        Ok(notification)
+    }
+
+    /// Reports a failed delivery attempt. Records the attempt, then either
+    /// reschedules the notification back onto the queue after a backoff
+    /// delay (if attempts remain) or dead-letters it (if this was the
+    /// last one).
+    pub async fn fail(
+        &self,
+        mut notification: Notification,
+        now: DateTime<Utc>,
+    ) -> QueueResult<Notification> {
+        notification.record_attempt(now);
+        notification.transition(DeliveryStatus::Failed, now)?;
+
+        if notification.has_attempts_remaining() {
+            notification.scheduled_for = Some(now + backoff::delay(notification.attempt_count));
+            notification.transition(DeliveryStatus::Queued, now)?;
+        } else {
+            notification.transition(DeliveryStatus::DeadLettered, now)?;
+        }
+
+        self.repo.update_notification(&notification).await?;
+        Ok(notification)
     }
 }
