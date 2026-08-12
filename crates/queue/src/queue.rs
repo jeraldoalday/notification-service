@@ -21,7 +21,11 @@ impl<R: NotificationRepository> NotificationQueue<R> {
 
     /// Moves a freshly-built (`Pending`) notification into the queue and
     /// persists it.
-    pub async fn submit(&self, mut notification: Notification, now: DateTime<Utc>) -> QueueResult<Notification> {
+    pub async fn submit(
+        &self,
+        mut notification: Notification,
+        now: DateTime<Utc>,
+    ) -> QueueResult<Notification> {
         notification.transition(DeliveryStatus::Queued, now)?;
         self.repo.insert_notification(&notification).await?;
         Ok(notification)
