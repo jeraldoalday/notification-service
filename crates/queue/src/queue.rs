@@ -30,4 +30,26 @@ impl<R: NotificationRepository> NotificationQueue<R> {
         self.repo.insert_notification(&notification).await?;
         Ok(notification)
     }
+
+    /// Claims up to `limit` due notifications for processing, moving each
+    /// to `Sending`. Fetches candidates via `due_for_delivery` and then
+    /// claims each one with a conditional write, so if another worker
+    /// (using a separate `NotificationQueue` over the same storage) claims
+    /// a candidate first, this call simply skips it rather than
+    /// double-dispatching -- the returned `Vec` may be shorter than
+    /// `limit` even when more due work exists.
+    pub async fn claim_batch(&self, now: DateTime<Utc>, limit: u32) -> QueueResult<Vec<Notification>> {
+        let candidates = self.repo.due_for_delivery(now, limit).await?;
+        let mut claimed = Vec::with_capacity(candidates.len());
+
+        for mut notification in candidates {
+            let expected_status = notification.status;
+            notification.transition(DeliveryStatus::Sending, now)?;
+            if self.repo.try_update_notification(&notification, expected_status).await? {
+                claimed.push(notification);
+            }
+        }
+
+        Ok(claimed)
+    }
 }
