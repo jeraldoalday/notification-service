@@ -11,7 +11,7 @@ overall design and current build status.
 ## Status
 
 Early and under active development. The domain model, configuration layer,
-and SQLite storage layer are in place; queueing, channel providers, the
+SQLite storage layer, and job queue are in place; channel providers, the
 HTTP API, and the worker are being built out next.
 
 ## Workspace layout
@@ -21,10 +21,11 @@ crates/
   core/     ns-core    -- domain models (Notification, Recipient, Channel, DeliveryStatus)
   config/   ns-config  -- TOML + environment variable configuration loading
   storage/  ns-storage -- Repository traits + SQLite implementation (sqlx)
+  queue/    ns-queue   -- job queue: submit, claim-for-processing, complete/fail with backoff
 ```
 
-More crates (`queue`, `channels`, `api`, `worker`, `cli`) will be added as
-they're built; see ARCHITECTURE.md for the roadmap.
+More crates (`channels`, `api`, `worker`, `cli`) will be added as they're
+built; see ARCHITECTURE.md for the roadmap.
 
 ## Development
 

@@ -33,9 +33,18 @@ so each concern can be tested and evolved independently:
   columns. The JSON blob stays the single source of truth for the entity
   itself, so adding a field to `Notification` or `Recipient` doesn't
   require a matching column or migration.
-- **`ns-queue`** (planned) -- durable job queue on top of the storage
-  layer: priority ordering, delayed/scheduled delivery, and dequeue-for-
-  processing semantics.
+- **`ns-queue`** -- durable job queue built on top of `ns-storage`'s
+  repositories. Priority ordering and delayed/scheduled delivery are
+  already handled by `due_for_delivery`, so `NotificationQueue` is
+  concerned with the state transitions around it: `submit` moves a fresh
+  notification to `Queued` and inserts it, `claim_batch` fetches due
+  candidates and claims each one's `Queued` -> `Sending` transition with
+  `try_update_notification` (a conditional write keyed on the expected
+  status), and `complete`/`fail` report the outcome back -- `fail`
+  reschedules onto the queue after an exponential backoff delay if
+  attempts remain, or dead-letters the notification otherwise. The
+  conditional-write claim is what lets multiple workers race on the same
+  `due_for_delivery` result set without double-dispatching a job.
 - **`ns-channels`** (planned) -- one module per delivery channel (email via
   SMTP/`lettre`, SMS and push via REST provider clients, webhooks via
   `reqwest`), all implementing a shared `NotificationChannel` trait so the
@@ -74,7 +83,7 @@ This file is updated as each part lands. Currently implemented:
 - [x] Domain model (`ns-core`)
 - [x] Configuration loading (`ns-config`)
 - [x] Storage layer (`ns-storage`)
-- [ ] Job queue
+- [x] Job queue (`ns-queue`)
 - [ ] Channel providers (email, SMS, push, webhook)
 - [ ] Rate limiting / circuit breaker
 - [ ] HTTP API
