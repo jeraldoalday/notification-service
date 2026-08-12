@@ -1,0 +1,19 @@
+[package]
+name = "ns-queue"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Durable job queue on top of ns-storage: priority ordering, scheduling, and dequeue-for-processing"
+
+[dependencies]
+ns-core = { path = "../core" }
+ns-storage = { path = "../storage" }
+chrono.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tempfile = "3"

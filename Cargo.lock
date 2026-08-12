@@ -782,6 +782,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ns-queue"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "ns-core",
+ "ns-storage",
+ "tempfile",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "ns-storage"
 version = "0.1.0"
 dependencies = [
