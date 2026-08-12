@@ -1,6 +1,6 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use ns_core::{Notification, Recipient};
+use ns_core::{DeliveryStatus, Notification, Recipient};
 use uuid::Uuid;
 
 use crate::error::StorageResult;
@@ -26,6 +26,19 @@ pub trait NotificationRepository: Send + Sync {
     /// Callers are expected to have already validated any status
     /// transition via `Notification::transition` -- this just saves it.
     async fn update_notification(&self, notification: &Notification) -> StorageResult<()>;
+
+    /// Like `update_notification`, but only writes if the row's current
+    /// status still matches `expected_status`. This is the primitive
+    /// `ns-queue` builds dequeue-for-processing on: multiple workers can
+    /// race on the same `due_for_delivery` result set, and only the one
+    /// whose write lands while the row is still in the expected status
+    /// wins the claim. Returns `true` if the write happened, `false` if
+    /// another caller had already moved the row on.
+    async fn try_update_notification(
+        &self,
+        notification: &Notification,
+        expected_status: DeliveryStatus,
+    ) -> StorageResult<bool>;
 
     /// Notifications in `Queued` status whose `scheduled_for` has passed
     /// (or is unset), ordered highest-priority-first and oldest-first

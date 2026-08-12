@@ -121,6 +121,33 @@ impl NotificationRepository for SqliteStorage {
         Ok(())
     }
 
+    async fn try_update_notification(
+        &self,
+        notification: &Notification,
+        expected_status: DeliveryStatus,
+    ) -> StorageResult<bool> {
+        let data = serde_json::to_string(notification)?;
+        let result = sqlx::query(
+            "UPDATE notifications
+             SET tenant_id = ?, status = ?, priority = ?, scheduled_for = ?,
+                 created_at = ?, updated_at = ?, data = ?
+             WHERE id = ? AND status = ?",
+        )
+        .bind(notification.tenant_id.to_string())
+        .bind(status_str(notification.status))
+        .bind(notification.priority.as_u8() as i64)
+        .bind(notification.scheduled_for.map(to_ts))
+        .bind(to_ts(notification.created_at))
+        .bind(to_ts(notification.updated_at))
+        .bind(data)
+        .bind(notification.id.to_string())
+        .bind(status_str(expected_status))
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() == 1)
+    }
+
     async fn due_for_delivery(&self, now: DateTime<Utc>, limit: u32) -> StorageResult<Vec<Notification>> {
         let rows = sqlx::query(
             "SELECT data FROM notifications
