@@ -1,10 +1,12 @@
 pub mod channel;
+pub mod email;
 pub mod error;
 pub mod push;
 pub mod sms;
 pub mod webhook;
 
 pub use channel::NotificationChannel;
+pub use email::EmailChannel;
 pub use error::{ChannelError, ChannelResult};
 pub use push::PushChannel;
 pub use sms::SmsChannel;
