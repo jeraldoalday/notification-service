@@ -45,10 +45,21 @@ so each concern can be tested and evolved independently:
   attempts remain, or dead-letters the notification otherwise. The
   conditional-write claim is what lets multiple workers race on the same
   `due_for_delivery` result set without double-dispatching a job.
-- **`ns-channels`** (planned) -- one module per delivery channel (email via
-  SMTP/`lettre`, SMS and push via REST provider clients, webhooks via
-  `reqwest`), all implementing a shared `NotificationChannel` trait so the
-  worker doesn't need to know about provider-specific details.
+- **`ns-channels`** -- one module per delivery channel, all implementing a
+  shared `NotificationChannel` trait (a single async `send(notification,
+  address)`) so the worker doesn't need to know about provider-specific
+  request/response shapes. `WebhookChannel` POSTs a JSON payload to the
+  recipient's URL via `reqwest`; `SmsChannel` and `PushChannel` are
+  generic Twilio-/FCM-style REST clients with an injectable `base_url`,
+  so tests point them at a local `wiremock` server instead of a real
+  provider; `EmailChannel` builds a MIME message with `lettre` and hands
+  it to an injectable `EmailTransport`, so tests substitute an in-memory
+  recorder for the real `AsyncSmtpTransport`. Every channel returns
+  `ChannelError::AddressMismatch` rather than panicking if handed the
+  wrong `RecipientAddress` variant, `ChannelError::Rejected` for a
+  non-2xx/provider-side rejection, and `ChannelError::Transport` if the
+  request never completed -- distinctions the planned `ns-worker` can use
+  to decide how to react to a failed send.
 - **`ns-api`** (planned) -- an `axum` HTTP API for submitting notifications,
   querying delivery status, and managing templates.
 - **`ns-worker`** (planned) -- the process that actually dequeues due jobs
@@ -84,7 +95,7 @@ This file is updated as each part lands. Currently implemented:
 - [x] Configuration loading (`ns-config`)
 - [x] Storage layer (`ns-storage`)
 - [x] Job queue (`ns-queue`)
-- [ ] Channel providers (email, SMS, push, webhook)
+- [x] Channel providers (email, SMS, push, webhook)
 - [ ] Rate limiting / circuit breaker
 - [ ] HTTP API
 - [ ] Worker process
