@@ -23,7 +23,8 @@ pub fn load_from_file(path: impl AsRef<Path>) -> Result<Settings, ConfigError> {
 ///
 /// Recognized keys: `NS_SERVER_HOST`, `NS_SERVER_PORT`, `NS_DATABASE_URL`,
 /// `NS_DATABASE_MAX_CONNECTIONS`, `NS_QUEUE_POLL_INTERVAL_MS`,
-/// `NS_QUEUE_BATCH_SIZE`, `NS_SMTP_HOST`, `NS_SMTP_PORT`, `NS_SMTP_USERNAME`.
+/// `NS_QUEUE_BATCH_SIZE`, `NS_QUEUE_MAX_RETRY_ATTEMPTS`, `NS_SMTP_HOST`,
+/// `NS_SMTP_PORT`, `NS_SMTP_USERNAME`, `NS_SMTP_FROM_ADDRESS`.
 /// Unrecognized keys are ignored so callers can pass through the full
 /// process environment safely.
 pub fn apply_overrides(
@@ -52,6 +53,7 @@ pub fn apply_overrides(
     parse_override!("NS_DATABASE_MAX_CONNECTIONS", settings.database.max_connections);
     parse_override!("NS_QUEUE_POLL_INTERVAL_MS", settings.queue.poll_interval_ms);
     parse_override!("NS_QUEUE_BATCH_SIZE", settings.queue.batch_size);
+    parse_override!("NS_QUEUE_MAX_RETRY_ATTEMPTS", settings.queue.max_retry_attempts);
 
     if let Some(host) = overrides.get("NS_SMTP_HOST") {
         settings.smtp.host = host.clone();
@@ -59,6 +61,9 @@ pub fn apply_overrides(
     parse_override!("NS_SMTP_PORT", settings.smtp.port);
     if let Some(user) = overrides.get("NS_SMTP_USERNAME") {
         settings.smtp.username = user.clone();
+    }
+    if let Some(from) = overrides.get("NS_SMTP_FROM_ADDRESS") {
+        settings.smtp.from_address = from.clone();
     }
 
     Ok(settings)
@@ -103,6 +108,21 @@ mod tests {
         let settings = apply_overrides(Settings::default(), &overrides).unwrap();
         assert_eq!(settings.server.port, 1234);
         assert_eq!(settings.database.url, "sqlite://test.db");
+    }
+
+    #[test]
+    fn overrides_apply_previously_unwired_keys() {
+        // NS_QUEUE_MAX_RETRY_ATTEMPTS and NS_SMTP_FROM_ADDRESS mirror
+        // fields that already had TOML support and a default -- they were
+        // just missing from apply_overrides, so a deployment couldn't tune
+        // them without editing the config file.
+        let mut overrides = HashMap::new();
+        overrides.insert("NS_QUEUE_MAX_RETRY_ATTEMPTS".to_string(), "8".to_string());
+        overrides.insert("NS_SMTP_FROM_ADDRESS".to_string(), "alerts@example.com".to_string());
+
+        let settings = apply_overrides(Settings::default(), &overrides).unwrap();
+        assert_eq!(settings.queue.max_retry_attempts, 8);
+        assert_eq!(settings.smtp.from_address, "alerts@example.com");
     }
 
     #[test]
