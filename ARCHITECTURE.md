@@ -65,19 +65,25 @@ so each concern can be tested and evolved independently:
 - **`ns-worker`** -- dequeues due notifications via `ns-queue::claim_batch`
   and dispatches each to the `ns-channels` implementation matching its
   `ChannelKind`, looked up through a `ChannelRegistry` built at startup from
-  whichever channels the deployment has credentials for. A per-channel
-  `RateLimiter` (token bucket) is consulted before every send, so a burst
-  against one provider can't starve another; a denied acquire is routed
-  through the same `NotificationQueue::fail` path as a provider rejection,
-  since `ns-core`'s `DeliveryStatus` state machine only allows leaving
-  `Sending` via `Delivered` or `Failed`. Every other business-level failure
+  whichever channels the deployment has credentials for. Two guards run
+  before every send: a per-channel `CircuitBreaker` (trips open after
+  consecutive failures on that channel, so a provider that's down doesn't
+  get hammered; half-opens after a cooldown to trial recovery) and a
+  per-channel `RateLimiter` (token bucket, so a burst against one provider
+  can't starve another). A denied guard is routed through the same
+  `NotificationQueue::fail` path as a provider rejection, since
+  `ns-core`'s `DeliveryStatus` state machine only allows leaving `Sending`
+  via `Delivered` or `Failed`; every other business-level failure
   (unregistered channel, recipient missing an address for the channel,
   transport/rejection from the provider) is routed through `fail` the same
-  way, so it gets ordinary backoff/dead-letter treatment; only genuine
-  storage/queue errors propagate out of a dispatch pass and abort the
-  batch. `Worker::run` polls on a fixed interval and stops in response to a
-  `tokio::sync::watch` shutdown signal, always finishing an in-flight pass
-  first so a shutdown never interrupts a claimed notification.
+  way, so it gets ordinary backoff/dead-letter treatment. Only an attempt
+  that actually reaches the provider (success or failure) is reported to
+  the circuit breaker -- being skipped by the rate limiter says nothing
+  about the provider's health. Only genuine storage/queue errors propagate
+  out of a dispatch pass and abort the batch. `Worker::run` polls on a
+  fixed interval and stops in response to a `tokio::sync::watch` shutdown
+  signal, always finishing an in-flight pass first so a shutdown never
+  interrupts a claimed notification.
 - **`ns-cli`** (planned) -- an admin CLI for operational tasks: sending test
   notifications, inspecting the queue, replaying dead-lettered jobs.
 
@@ -110,7 +116,7 @@ This file is updated as each part lands. Currently implemented:
 - [x] Job queue (`ns-queue`)
 - [x] Channel providers (email, SMS, push, webhook)
 - [x] Worker process (`ns-worker`)
-- [x] Rate limiting (per-channel token bucket); circuit breaker still open
+- [x] Rate limiting / circuit breaker (per-channel token bucket + breaker)
 - [ ] HTTP API
 - [ ] Observability (metrics, tracing)
 - [ ] Admin CLI
