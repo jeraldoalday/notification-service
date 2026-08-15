@@ -23,11 +23,34 @@ crates/
   storage/  ns-storage  -- Repository traits + SQLite implementation (sqlx)
   queue/    ns-queue    -- job queue: submit, claim-for-processing, complete/fail with backoff
   channels/ ns-channels -- email, SMS, push, and webhook delivery behind a shared trait
-  worker/   ns-worker   -- dequeues due notifications and dispatches them, with per-channel rate limiting
+  worker/   ns-worker   -- dequeues due notifications and dispatches them, with per-channel rate limiting and circuit breaking
 ```
 
 More crates (`api`, `cli`) will be added as they're built; see
 ARCHITECTURE.md for the roadmap.
+
+## Running the worker
+
+`ns-worker::Worker` wraps a storage backend, a `ChannelRegistry` of
+providers, a `RateLimiter`, and a `CircuitBreaker`. A typical embedding
+loop looks like:
+
+```rust
+let storage = SqliteStorage::connect(&settings.database.url).await?;
+let channels = ChannelRegistry::new()
+    .register(ChannelKind::Webhook, Arc::new(WebhookChannel::default()));
+let rate_limiter = RateLimiter::new().with_limit(ChannelKind::Webhook, 50, 10.0);
+let circuit_breaker = CircuitBreaker::new(5, chrono::Duration::seconds(30));
+
+let worker = Worker::new(storage, channels, rate_limiter, circuit_breaker);
+let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+worker.run(settings.queue.batch_size, poll_interval, shutdown_rx).await?;
+```
+
+Register only the channels a deployment has credentials for --
+`ns_worker::WorkerError::UnregisteredChannel` fails (and retries) any
+notification whose `ChannelKind` has nothing registered, rather than
+panicking.
 
 ## Development
 
@@ -45,7 +68,9 @@ cargo fmt --all
 
 Settings are loaded from a TOML file (see `config/default.toml` for the
 full set of keys and their defaults) and can be overridden per-key with
-`NS_*` environment variables, e.g. `NS_SERVER_PORT=9090`.
+`NS_*` environment variables, e.g. `NS_SERVER_PORT=9090`. See
+`crates/config/src/loader.rs` for the full list of recognized keys,
+including `NS_QUEUE_MAX_RETRY_ATTEMPTS` and `NS_SMTP_FROM_ADDRESS`.
 
 ## License
 
