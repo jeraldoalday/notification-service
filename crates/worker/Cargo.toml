@@ -1,0 +1,22 @@
+[package]
+name = "ns-worker"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Dispatches due notifications from ns-queue to ns-channels, with per-channel rate limiting"
+
+[dependencies]
+ns-core = { path = "../core" }
+ns-storage = { path = "../storage" }
+ns-queue = { path = "../queue" }
+ns-channels = { path = "../channels" }
+chrono.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
