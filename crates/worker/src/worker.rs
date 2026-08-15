@@ -148,3 +148,186 @@ impl<R: NotificationRepository + RecipientRepository + Clone> Worker<R> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use async_trait::async_trait;
+    use ns_channels::{ChannelError, ChannelResult, NotificationChannel};
+    use ns_core::{ChannelKind, Priority, Recipient, RecipientAddress};
+    use ns_storage::SqliteStorage;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use uuid::Uuid;
+
+    #[derive(Default)]
+    struct FakeChannel {
+        should_succeed: bool,
+        calls: AtomicUsize,
+    }
+
+    impl FakeChannel {
+        fn succeeding() -> Self {
+            Self { should_succeed: true, calls: AtomicUsize::new(0) }
+        }
+
+        fn failing() -> Self {
+            Self { should_succeed: false, calls: AtomicUsize::new(0) }
+        }
+    }
+
+    #[async_trait]
+    impl NotificationChannel for FakeChannel {
+        async fn send(&self, _notification: &Notification, _address: &RecipientAddress) -> ChannelResult<()> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            if self.should_succeed {
+                Ok(())
+            } else {
+                Err(ChannelError::Rejected("simulated rejection".into()))
+            }
+        }
+    }
+
+    async fn test_repo() -> (SqliteStorage, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let storage = SqliteStorage::connect(&format!("sqlite://{}", db_path.display())).await.unwrap();
+        (storage, dir)
+    }
+
+    async fn seed_recipient(repo: &SqliteStorage, channel: ChannelKind) -> Uuid {
+        let address = match channel {
+            ChannelKind::Email => RecipientAddress::Email("ada@example.com".into()),
+            ChannelKind::Sms => RecipientAddress::Phone("+15555550100".into()),
+            ChannelKind::Push => RecipientAddress::PushToken("device-token".into()),
+            ChannelKind::Webhook => RecipientAddress::WebhookUrl("https://example.com/hook".into()),
+        };
+        let recipient = Recipient::new(Uuid::new_v4()).with_address(address).unwrap();
+        repo.insert_recipient(&recipient).await.unwrap();
+        recipient.id
+    }
+
+    async fn seed_notification(repo: &SqliteStorage, recipient_id: Uuid, max_attempts: u32) -> Notification {
+        let queue = NotificationQueue::new(repo.clone());
+        let notification = Notification::builder(Uuid::new_v4(), recipient_id, ChannelKind::Webhook)
+            .body("hello")
+            .priority(Priority::Normal)
+            .max_attempts(max_attempts)
+            .build()
+            .unwrap();
+        queue.submit(notification, Utc::now()).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn delivers_successfully_and_marks_delivered() {
+        let (repo, _dir) = test_repo().await;
+        let recipient_id = seed_recipient(&repo, ChannelKind::Webhook).await;
+        let submitted = seed_notification(&repo, recipient_id, 3).await;
+
+        let registry =
+            ChannelRegistry::new().register(ChannelKind::Webhook, Arc::new(FakeChannel::succeeding()));
+        let worker = Worker::new(repo.clone(), registry, RateLimiter::new());
+
+        let outcomes = worker.run_once(10).await.unwrap();
+
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0].0.id, submitted.id);
+        assert_eq!(outcomes[0].1, DispatchOutcome::Delivered);
+
+        let stored = repo.get_notification(submitted.id).await.unwrap();
+        assert_eq!(stored.status, DeliveryStatus::Delivered);
+    }
+
+    #[tokio::test]
+    async fn requeues_with_backoff_when_send_fails_and_attempts_remain() {
+        let (repo, _dir) = test_repo().await;
+        let recipient_id = seed_recipient(&repo, ChannelKind::Webhook).await;
+        let submitted = seed_notification(&repo, recipient_id, 3).await;
+
+        let registry =
+            ChannelRegistry::new().register(ChannelKind::Webhook, Arc::new(FakeChannel::failing()));
+        let worker = Worker::new(repo.clone(), registry, RateLimiter::new());
+
+        let outcomes = worker.run_once(10).await.unwrap();
+
+        assert_eq!(outcomes[0].1, DispatchOutcome::Failed);
+        let stored = repo.get_notification(submitted.id).await.unwrap();
+        assert_eq!(stored.status, DeliveryStatus::Queued);
+        assert_eq!(stored.attempt_count, 1);
+    }
+
+    #[tokio::test]
+    async fn dead_letters_once_attempts_are_exhausted() {
+        let (repo, _dir) = test_repo().await;
+        let recipient_id = seed_recipient(&repo, ChannelKind::Webhook).await;
+        let submitted = seed_notification(&repo, recipient_id, 1).await;
+
+        let registry =
+            ChannelRegistry::new().register(ChannelKind::Webhook, Arc::new(FakeChannel::failing()));
+        let worker = Worker::new(repo.clone(), registry, RateLimiter::new());
+
+        let outcomes = worker.run_once(10).await.unwrap();
+
+        assert_eq!(outcomes[0].1, DispatchOutcome::DeadLettered);
+        let stored = repo.get_notification(submitted.id).await.unwrap();
+        assert_eq!(stored.status, DeliveryStatus::DeadLettered);
+    }
+
+    #[tokio::test]
+    async fn fails_when_no_channel_is_registered() {
+        let (repo, _dir) = test_repo().await;
+        let recipient_id = seed_recipient(&repo, ChannelKind::Webhook).await;
+        seed_notification(&repo, recipient_id, 3).await;
+
+        let worker = Worker::new(repo.clone(), ChannelRegistry::new(), RateLimiter::new());
+
+        let outcomes = worker.run_once(10).await.unwrap();
+
+        assert_eq!(outcomes[0].1, DispatchOutcome::Failed);
+    }
+
+    #[tokio::test]
+    async fn fails_when_recipient_has_no_address_for_the_channel() {
+        let (repo, _dir) = test_repo().await;
+        // Recipient only has an email address, but the notification is on
+        // the webhook channel.
+        let recipient_id = seed_recipient(&repo, ChannelKind::Email).await;
+        seed_notification(&repo, recipient_id, 3).await;
+
+        let registry =
+            ChannelRegistry::new().register(ChannelKind::Webhook, Arc::new(FakeChannel::succeeding()));
+        let worker = Worker::new(repo.clone(), registry, RateLimiter::new());
+
+        let outcomes = worker.run_once(10).await.unwrap();
+
+        assert_eq!(outcomes[0].1, DispatchOutcome::Failed);
+    }
+
+    #[tokio::test]
+    async fn rate_limited_channel_fails_the_attempt_instead_of_sending() {
+        let (repo, _dir) = test_repo().await;
+        let recipient_id = seed_recipient(&repo, ChannelKind::Webhook).await;
+        seed_notification(&repo, recipient_id, 3).await;
+
+        let channel = Arc::new(FakeChannel::succeeding());
+        let registry = ChannelRegistry::new().register(ChannelKind::Webhook, channel.clone());
+        // Zero capacity: the very first acquire attempt is denied.
+        let rate_limiter = RateLimiter::new().with_limit(ChannelKind::Webhook, 0, 1.0);
+        let worker = Worker::new(repo.clone(), registry, rate_limiter);
+
+        let outcomes = worker.run_once(10).await.unwrap();
+
+        assert_eq!(outcomes[0].1, DispatchOutcome::Failed);
+        assert_eq!(channel.calls.load(Ordering::SeqCst), 0, "channel must not be invoked when rate limited");
+    }
+
+    #[tokio::test]
+    async fn run_once_is_a_noop_when_nothing_is_due() {
+        let (repo, _dir) = test_repo().await;
+        let worker = Worker::new(repo, ChannelRegistry::new(), RateLimiter::new());
+
+        let outcomes = worker.run_once(10).await.unwrap();
+
+        assert!(outcomes.is_empty());
+    }
+}
