@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use ns_core::{DeliveryStatus, Notification};
 use ns_queue::NotificationQueue;
 use ns_storage::{NotificationRepository, RecipientRepository};
-use tracing::warn;
+use tracing::{info, warn};
 
 use crate::error::WorkerResult;
 use crate::rate_limit::RateLimiter;
@@ -116,5 +116,35 @@ impl<R: NotificationRepository + RecipientRepository + Clone> Worker<R> {
         }
 
         Ok(outcomes)
+    }
+
+    /// Repeatedly calls `run_once` on `poll_interval`, until `shutdown`
+    /// carries `true`. Each pass runs to completion before the shutdown
+    /// flag is checked, so a shutdown signal never interrupts a
+    /// notification that's already been claimed.
+    pub async fn run(
+        &self,
+        batch_size: u32,
+        poll_interval: std::time::Duration,
+        mut shutdown: tokio::sync::watch::Receiver<bool>,
+    ) -> WorkerResult<()> {
+        loop {
+            self.run_once(batch_size).await?;
+
+            if *shutdown.borrow() {
+                info!("worker received shutdown signal, stopping");
+                return Ok(());
+            }
+
+            tokio::select! {
+                _ = tokio::time::sleep(poll_interval) => {}
+                _ = shutdown.changed() => {}
+            }
+
+            if *shutdown.borrow() {
+                info!("worker received shutdown signal, stopping");
+                return Ok(());
+            }
+        }
     }
 }
