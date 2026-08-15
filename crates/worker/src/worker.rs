@@ -397,4 +397,37 @@ mod tests {
         assert!(outcomes.iter().all(|(_, outcome)| *outcome == DispatchOutcome::Failed));
         assert_eq!(channel.calls.load(Ordering::SeqCst), 2, "breaker should stop the third send attempt");
     }
+
+    #[tokio::test]
+    async fn run_polls_until_shutdown_and_delivers_in_the_meantime() {
+        let (repo, _dir) = test_repo().await;
+        let recipient_id = seed_recipient(&repo, ChannelKind::Webhook).await;
+        let submitted = seed_notification(&repo, recipient_id, 3).await;
+
+        let registry =
+            ChannelRegistry::new().register(ChannelKind::Webhook, Arc::new(FakeChannel::succeeding()));
+        let worker =
+            Arc::new(Worker::new(repo.clone(), registry, RateLimiter::new(), CircuitBreaker::disabled()));
+
+        let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+        let running = Arc::clone(&worker);
+        let handle =
+            tokio::spawn(
+                async move { running.run(10, std::time::Duration::from_millis(5), shutdown_rx).await },
+            );
+
+        // Give the loop a few polls to pick up and deliver the seeded
+        // notification before asking it to stop.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        shutdown_tx.send(true).unwrap();
+
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), handle)
+            .await
+            .expect("worker should stop promptly after the shutdown signal")
+            .unwrap();
+        assert!(outcome.is_ok());
+
+        let stored = repo.get_notification(submitted.id).await.unwrap();
+        assert_eq!(stored.status, DeliveryStatus::Delivered);
+    }
 }
