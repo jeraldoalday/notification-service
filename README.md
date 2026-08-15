@@ -11,8 +11,8 @@ overall design and current build status.
 ## Status
 
 Early and under active development. The domain model, configuration layer,
-SQLite storage layer, job queue, and channel providers are in place; the
-HTTP API and the worker are being built out next.
+SQLite storage layer, job queue, channel providers, and worker process are
+in place; the HTTP API is being built out next.
 
 ## Workspace layout
 
@@ -23,15 +23,16 @@ crates/
   storage/  ns-storage  -- Repository traits + SQLite implementation (sqlx)
   queue/    ns-queue    -- job queue: submit, claim-for-processing, complete/fail with backoff
   channels/ ns-channels -- email, SMS, push, and webhook delivery behind a shared trait
+  worker/   ns-worker   -- dequeues due notifications and dispatches them, with per-channel rate limiting
 ```
 
-More crates (`api`, `worker`, `cli`) will be added as they're built; see
+More crates (`api`, `cli`) will be added as they're built; see
 ARCHITECTURE.md for the roadmap.
 
 ## Development
 
-Requires a stable Rust toolchain (see `rust-toolchain` pinned version isn't
-set yet; any recent stable works).
+Requires a stable Rust toolchain -- see `rust-toolchain.toml` for the
+version pinned for local development via `rustup`.
 
 ```sh
 cargo build --workspace

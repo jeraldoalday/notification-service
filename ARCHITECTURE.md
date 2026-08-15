@@ -62,9 +62,22 @@ so each concern can be tested and evolved independently:
   to decide how to react to a failed send.
 - **`ns-api`** (planned) -- an `axum` HTTP API for submitting notifications,
   querying delivery status, and managing templates.
-- **`ns-worker`** (planned) -- the process that actually dequeues due jobs
-  and dispatches them to the right channel, handling retries and eventual
-  dead-lettering.
+- **`ns-worker`** -- dequeues due notifications via `ns-queue::claim_batch`
+  and dispatches each to the `ns-channels` implementation matching its
+  `ChannelKind`, looked up through a `ChannelRegistry` built at startup from
+  whichever channels the deployment has credentials for. A per-channel
+  `RateLimiter` (token bucket) is consulted before every send, so a burst
+  against one provider can't starve another; a denied acquire is routed
+  through the same `NotificationQueue::fail` path as a provider rejection,
+  since `ns-core`'s `DeliveryStatus` state machine only allows leaving
+  `Sending` via `Delivered` or `Failed`. Every other business-level failure
+  (unregistered channel, recipient missing an address for the channel,
+  transport/rejection from the provider) is routed through `fail` the same
+  way, so it gets ordinary backoff/dead-letter treatment; only genuine
+  storage/queue errors propagate out of a dispatch pass and abort the
+  batch. `Worker::run` polls on a fixed interval and stops in response to a
+  `tokio::sync::watch` shutdown signal, always finishing an in-flight pass
+  first so a shutdown never interrupts a claimed notification.
 - **`ns-cli`** (planned) -- an admin CLI for operational tasks: sending test
   notifications, inspecting the queue, replaying dead-lettered jobs.
 
@@ -96,9 +109,9 @@ This file is updated as each part lands. Currently implemented:
 - [x] Storage layer (`ns-storage`)
 - [x] Job queue (`ns-queue`)
 - [x] Channel providers (email, SMS, push, webhook)
-- [ ] Rate limiting / circuit breaker
+- [x] Worker process (`ns-worker`)
+- [x] Rate limiting (per-channel token bucket); circuit breaker still open
 - [ ] HTTP API
-- [ ] Worker process
 - [ ] Observability (metrics, tracing)
 - [ ] Admin CLI
 - [ ] Auth & multi-tenancy
