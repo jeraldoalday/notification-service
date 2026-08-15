@@ -4,6 +4,7 @@ use ns_queue::NotificationQueue;
 use ns_storage::{NotificationRepository, RecipientRepository};
 use tracing::{info, warn};
 
+use crate::circuit_breaker::CircuitBreaker;
 use crate::error::WorkerResult;
 use crate::rate_limit::RateLimiter;
 use crate::registry::ChannelRegistry;
@@ -37,28 +38,43 @@ pub struct Worker<R> {
     repo: R,
     channels: ChannelRegistry,
     rate_limiter: RateLimiter,
+    circuit_breaker: CircuitBreaker,
 }
 
 impl<R: NotificationRepository + RecipientRepository + Clone> Worker<R> {
-    pub fn new(repo: R, channels: ChannelRegistry, rate_limiter: RateLimiter) -> Self {
-        Self { queue: NotificationQueue::new(repo.clone()), repo, channels, rate_limiter }
+    pub fn new(
+        repo: R,
+        channels: ChannelRegistry,
+        rate_limiter: RateLimiter,
+        circuit_breaker: CircuitBreaker,
+    ) -> Self {
+        Self { queue: NotificationQueue::new(repo.clone()), repo, channels, rate_limiter, circuit_breaker }
     }
 
-    /// Dispatches a single already-claimed (`Sending`) notification:
-    /// checks the rate limiter, looks up the registered channel and the
-    /// recipient's address for it, sends, and reports the outcome back to
-    /// the queue. Every business-level failure (rate limited, unregistered
+    /// Dispatches a single already-claimed (`Sending`) notification: checks
+    /// the circuit breaker and rate limiter, looks up the registered
+    /// channel and the recipient's address for it, sends, and reports the
+    /// outcome back to the queue and the circuit breaker. Every
+    /// business-level failure (breaker open, rate limited, unregistered
     /// channel, missing address, provider rejection/transport error) is
     /// routed through `NotificationQueue::fail` so it gets the same
     /// backoff/dead-letter treatment as any other failed attempt --
     /// infrastructure errors (storage/queue) instead propagate via `?` and
     /// abort the batch, since retrying those without fixing the underlying
-    /// problem would just busy-loop.
+    /// problem would just busy-loop. Only an actual send attempt reaching
+    /// the provider (success or failure) is reported to the circuit
+    /// breaker; being skipped by the rate limiter or a missing
+    /// address/channel says nothing about the provider's health.
     async fn dispatch_one(
         &self,
         notification: Notification,
         now: DateTime<Utc>,
     ) -> WorkerResult<DispatchOutcome> {
+        if !self.circuit_breaker.allow(notification.channel, now) {
+            let failed = self.queue.fail(notification, now).await?;
+            return Ok(outcome_from_status(failed.status));
+        }
+
         if !self.rate_limiter.try_acquire(notification.channel, now) {
             let failed = self.queue.fail(notification, now).await?;
             return Ok(outcome_from_status(failed.status));
@@ -90,10 +106,12 @@ impl<R: NotificationRepository + RecipientRepository + Clone> Worker<R> {
 
         match channel.send(&notification, address).await {
             Ok(()) => {
+                self.circuit_breaker.record_success(notification.channel);
                 self.queue.complete(notification, now).await?;
                 Ok(DispatchOutcome::Delivered)
             }
             Err(err) => {
+                self.circuit_breaker.record_failure(notification.channel, now);
                 warn!(notification_id = %notification.id, error = %err, "delivery attempt failed");
                 let failed = self.queue.fail(notification, now).await?;
                 Ok(outcome_from_status(failed.status))
@@ -153,6 +171,7 @@ impl<R: NotificationRepository + RecipientRepository + Clone> Worker<R> {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use chrono::Duration;
     use ns_channels::{ChannelError, ChannelResult, NotificationChannel};
     use ns_core::{ChannelKind, Priority, Recipient, RecipientAddress};
     use ns_storage::SqliteStorage;
@@ -226,7 +245,7 @@ mod tests {
 
         let registry =
             ChannelRegistry::new().register(ChannelKind::Webhook, Arc::new(FakeChannel::succeeding()));
-        let worker = Worker::new(repo.clone(), registry, RateLimiter::new());
+        let worker = Worker::new(repo.clone(), registry, RateLimiter::new(), CircuitBreaker::disabled());
 
         let outcomes = worker.run_once(10).await.unwrap();
 
@@ -246,7 +265,7 @@ mod tests {
 
         let registry =
             ChannelRegistry::new().register(ChannelKind::Webhook, Arc::new(FakeChannel::failing()));
-        let worker = Worker::new(repo.clone(), registry, RateLimiter::new());
+        let worker = Worker::new(repo.clone(), registry, RateLimiter::new(), CircuitBreaker::disabled());
 
         let outcomes = worker.run_once(10).await.unwrap();
 
@@ -264,7 +283,7 @@ mod tests {
 
         let registry =
             ChannelRegistry::new().register(ChannelKind::Webhook, Arc::new(FakeChannel::failing()));
-        let worker = Worker::new(repo.clone(), registry, RateLimiter::new());
+        let worker = Worker::new(repo.clone(), registry, RateLimiter::new(), CircuitBreaker::disabled());
 
         let outcomes = worker.run_once(10).await.unwrap();
 
@@ -279,7 +298,8 @@ mod tests {
         let recipient_id = seed_recipient(&repo, ChannelKind::Webhook).await;
         seed_notification(&repo, recipient_id, 3).await;
 
-        let worker = Worker::new(repo.clone(), ChannelRegistry::new(), RateLimiter::new());
+        let worker =
+            Worker::new(repo.clone(), ChannelRegistry::new(), RateLimiter::new(), CircuitBreaker::disabled());
 
         let outcomes = worker.run_once(10).await.unwrap();
 
@@ -296,7 +316,7 @@ mod tests {
 
         let registry =
             ChannelRegistry::new().register(ChannelKind::Webhook, Arc::new(FakeChannel::succeeding()));
-        let worker = Worker::new(repo.clone(), registry, RateLimiter::new());
+        let worker = Worker::new(repo.clone(), registry, RateLimiter::new(), CircuitBreaker::disabled());
 
         let outcomes = worker.run_once(10).await.unwrap();
 
@@ -313,7 +333,7 @@ mod tests {
         let registry = ChannelRegistry::new().register(ChannelKind::Webhook, channel.clone());
         // Zero capacity: the very first acquire attempt is denied.
         let rate_limiter = RateLimiter::new().with_limit(ChannelKind::Webhook, 0, 1.0);
-        let worker = Worker::new(repo.clone(), registry, rate_limiter);
+        let worker = Worker::new(repo.clone(), registry, rate_limiter, CircuitBreaker::disabled());
 
         let outcomes = worker.run_once(10).await.unwrap();
 
@@ -324,10 +344,57 @@ mod tests {
     #[tokio::test]
     async fn run_once_is_a_noop_when_nothing_is_due() {
         let (repo, _dir) = test_repo().await;
-        let worker = Worker::new(repo, ChannelRegistry::new(), RateLimiter::new());
+        let worker =
+            Worker::new(repo, ChannelRegistry::new(), RateLimiter::new(), CircuitBreaker::disabled());
 
         let outcomes = worker.run_once(10).await.unwrap();
 
         assert!(outcomes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn open_circuit_breaker_fails_the_attempt_without_invoking_the_channel() {
+        let (repo, _dir) = test_repo().await;
+        let recipient_id = seed_recipient(&repo, ChannelKind::Webhook).await;
+        seed_notification(&repo, recipient_id, 3).await;
+
+        let channel = Arc::new(FakeChannel::succeeding());
+        let registry = ChannelRegistry::new().register(ChannelKind::Webhook, channel.clone());
+        let circuit_breaker = CircuitBreaker::new(1, Duration::seconds(60));
+        // Pre-trip the breaker as if a prior send had already failed.
+        circuit_breaker.record_failure(ChannelKind::Webhook, Utc::now());
+        let worker = Worker::new(repo.clone(), registry, RateLimiter::new(), circuit_breaker);
+
+        let outcomes = worker.run_once(10).await.unwrap();
+
+        assert_eq!(outcomes[0].1, DispatchOutcome::Failed);
+        assert_eq!(
+            channel.calls.load(Ordering::SeqCst),
+            0,
+            "channel must not be invoked while the breaker is open"
+        );
+    }
+
+    #[tokio::test]
+    async fn repeated_send_failures_trip_the_breaker_and_stop_further_attempts() {
+        let (repo, _dir) = test_repo().await;
+        let recipient_id = seed_recipient(&repo, ChannelKind::Webhook).await;
+        for _ in 0..3 {
+            seed_notification(&repo, recipient_id, 5).await;
+        }
+
+        let channel = Arc::new(FakeChannel::failing());
+        let registry = ChannelRegistry::new().register(ChannelKind::Webhook, channel.clone());
+        let circuit_breaker = CircuitBreaker::new(2, Duration::seconds(60));
+        let worker = Worker::new(repo.clone(), registry, RateLimiter::new(), circuit_breaker);
+
+        // Three notifications claimed in one pass: the first two fail and
+        // trip the breaker after the second, so the third is denied before
+        // the channel is ever invoked for it.
+        let outcomes = worker.run_once(10).await.unwrap();
+
+        assert_eq!(outcomes.len(), 3);
+        assert!(outcomes.iter().all(|(_, outcome)| *outcome == DispatchOutcome::Failed));
+        assert_eq!(channel.calls.load(Ordering::SeqCst), 2, "breaker should stop the third send attempt");
     }
 }
