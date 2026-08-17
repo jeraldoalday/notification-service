@@ -1,0 +1,18 @@
+use axum::routing::get;
+use axum::Router;
+use ns_storage::{NotificationRepository, RecipientRepository};
+
+use crate::state::AppState;
+
+mod health;
+
+/// Builds the full route table over a generic repository, mirroring
+/// `ns_worker::Worker<R>`'s approach: the API doesn't care whether `R` is
+/// `SqliteStorage` or a test double, only that it implements the
+/// repository traits it needs.
+pub fn build_router<R>(state: AppState<R>) -> Router
+where
+    R: NotificationRepository + RecipientRepository + Clone + Send + Sync + 'static,
+{
+    Router::new().route("/health", get(health::health)).with_state(state)
+}

@@ -7,6 +7,7 @@ members = [
     "crates/queue",
     "crates/channels",
     "crates/worker",
+    "crates/api",
 ]
 
 [workspace.package]
