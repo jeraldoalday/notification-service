@@ -110,3 +110,21 @@ where
     let notification = state.repo.get_notification(id).await?;
     Ok(Json(notification.into()))
 }
+
+/// Cancels a notification that hasn't started sending yet. `Notification`'s
+/// own state machine (`DeliveryStatus::can_transition_to`) is what actually
+/// decides whether that's legal -- only `Pending` and `Queued` can move to
+/// `Cancelled`, so a notification already `Sending` or terminal returns a
+/// 409 via `CoreError::InvalidTransition` rather than silently no-opping.
+pub async fn cancel_notification<R>(
+    State(state): State<AppState<R>>,
+    Path(id): Path<Uuid>,
+) -> ApiResult<Json<NotificationResponse>>
+where
+    R: NotificationRepository + RecipientRepository + Clone,
+{
+    let mut notification = state.repo.get_notification(id).await?;
+    notification.transition(DeliveryStatus::Cancelled, Utc::now())?;
+    state.repo.update_notification(&notification).await?;
+    Ok(Json(notification.into()))
+}

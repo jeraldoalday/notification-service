@@ -89,6 +89,65 @@ async fn get_unknown_notification_is_404() {
 }
 
 #[tokio::test]
+async fn cancels_a_queued_notification() {
+    let (app, _dir) = test_app().await;
+    let recipient_id = create_recipient(&app).await;
+
+    let submit = post_json(
+        "/notifications",
+        json!({
+            "tenant_id": "11111111-1111-1111-1111-111111111111",
+            "recipient_id": recipient_id,
+            "channel": "email",
+            "body": "hi"
+        }),
+    );
+    let created: Value = json_body(send(&app, submit).await).await;
+    let id = created["id"].as_str().unwrap();
+
+    let cancel = send(&app, post_json(&format!("/notifications/{id}/cancel"), json!({}))).await;
+    assert_eq!(cancel.status(), StatusCode::OK);
+    let cancelled: Value = json_body(cancel).await;
+    assert_eq!(cancelled["status"], "cancelled");
+
+    let fetched: Value = json_body(send(&app, get(&format!("/notifications/{id}"))).await).await;
+    assert_eq!(fetched["status"], "cancelled");
+}
+
+#[tokio::test]
+async fn cancelling_an_already_cancelled_notification_is_a_conflict() {
+    let (app, _dir) = test_app().await;
+    let recipient_id = create_recipient(&app).await;
+
+    let submit = post_json(
+        "/notifications",
+        json!({
+            "tenant_id": "11111111-1111-1111-1111-111111111111",
+            "recipient_id": recipient_id,
+            "channel": "email",
+            "body": "hi"
+        }),
+    );
+    let created: Value = json_body(send(&app, submit).await).await;
+    let id = created["id"].as_str().unwrap();
+
+    send(&app, post_json(&format!("/notifications/{id}/cancel"), json!({}))).await;
+    let second = send(&app, post_json(&format!("/notifications/{id}/cancel"), json!({}))).await;
+
+    assert_eq!(second.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn cancelling_an_unknown_notification_is_404() {
+    let (app, _dir) = test_app().await;
+
+    let response =
+        send(&app, post_json("/notifications/00000000-0000-0000-0000-000000000000/cancel", json!({}))).await;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn submitted_notification_defaults_to_normal_priority_and_five_attempts() {
     let (app, _dir) = test_app().await;
     let recipient_id = create_recipient(&app).await;

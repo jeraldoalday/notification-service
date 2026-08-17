@@ -22,5 +22,6 @@ where
         .route("/recipients/{id}", get(recipients::get_recipient))
         .route("/notifications", post(notifications::submit_notification))
         .route("/notifications/{id}", get(notifications::get_notification))
+        .route("/notifications/{id}/cancel", post(notifications::cancel_notification))
         .with_state(state)
 }
