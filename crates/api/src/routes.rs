@@ -5,6 +5,7 @@ use ns_storage::{NotificationRepository, RecipientRepository};
 use crate::state::AppState;
 
 mod health;
+pub mod notifications;
 pub mod recipients;
 
 /// Builds the full route table over a generic repository, mirroring
@@ -19,5 +20,7 @@ where
         .route("/health", get(health::health))
         .route("/recipients", post(recipients::create_recipient))
         .route("/recipients/{id}", get(recipients::get_recipient))
+        .route("/notifications", post(notifications::submit_notification))
+        .route("/notifications/{id}", get(notifications::get_notification))
         .with_state(state)
 }
