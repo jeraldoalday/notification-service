@@ -1,6 +1,7 @@
 use axum::routing::{get, post};
 use axum::Router;
 use ns_storage::{NotificationRepository, RecipientRepository};
+use tower_http::trace::TraceLayer;
 
 use crate::state::AppState;
 
@@ -26,5 +27,6 @@ where
         )
         .route("/notifications/{id}", get(notifications::get_notification))
         .route("/notifications/{id}/cancel", post(notifications::cancel_notification))
+        .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
