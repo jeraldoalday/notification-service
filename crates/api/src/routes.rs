@@ -1,10 +1,11 @@
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::Router;
 use ns_storage::{NotificationRepository, RecipientRepository};
 
 use crate::state::AppState;
 
 mod health;
+pub mod recipients;
 
 /// Builds the full route table over a generic repository, mirroring
 /// `ns_worker::Worker<R>`'s approach: the API doesn't care whether `R` is
@@ -14,5 +15,9 @@ pub fn build_router<R>(state: AppState<R>) -> Router
 where
     R: NotificationRepository + RecipientRepository + Clone + Send + Sync + 'static,
 {
-    Router::new().route("/health", get(health::health)).with_state(state)
+    Router::new()
+        .route("/health", get(health::health))
+        .route("/recipients", post(recipients::create_recipient))
+        .route("/recipients/{id}", get(recipients::get_recipient))
+        .with_state(state)
 }
