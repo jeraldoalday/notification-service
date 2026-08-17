@@ -1,3 +1,5 @@
+use axum::extract::rejection::JsonRejection;
+use axum::extract::{FromRequest, Request};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::Json;
@@ -33,6 +35,32 @@ pub enum ApiError {
 #[derive(Serialize)]
 struct ErrorBody {
     error: String,
+}
+
+/// Drop-in replacement for `axum::Json` as a request extractor: on success
+/// it behaves identically, but on failure (malformed JSON, wrong
+/// `Content-Type`, a value that doesn't match the target type) it reports
+/// through the same `{"error": "..."}` envelope as every other failure
+/// mode in this API instead of `axum::Json`'s plain-text rejection body,
+/// while preserving the status code axum would have chosen (400/415/422).
+pub struct ApiJson<T>(pub T);
+
+impl<S, T> FromRequest<S> for ApiJson<T>
+where
+    Json<T>: FromRequest<S, Rejection = JsonRejection>,
+    S: Send + Sync,
+{
+    type Rejection = Response;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        match Json::<T>::from_request(req, state).await {
+            Ok(Json(value)) => Ok(ApiJson(value)),
+            Err(rejection) => {
+                let body = ErrorBody { error: rejection.body_text() };
+                Err((rejection.status(), Json(body)).into_response())
+            }
+        }
+    }
 }
 
 fn status_for_core(err: &CoreError) -> StatusCode {

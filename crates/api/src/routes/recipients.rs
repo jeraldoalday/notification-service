@@ -6,7 +6,7 @@ use ns_storage::{NotificationRepository, RecipientRepository};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::error::ApiResult;
+use crate::error::{ApiJson, ApiResult};
 use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
@@ -35,7 +35,7 @@ impl From<Recipient> for RecipientResponse {
 
 pub async fn create_recipient<R>(
     State(state): State<AppState<R>>,
-    Json(request): Json<CreateRecipientRequest>,
+    ApiJson(request): ApiJson<CreateRecipientRequest>,
 ) -> ApiResult<(StatusCode, Json<RecipientResponse>)>
 where
     R: NotificationRepository + RecipientRepository + Clone,

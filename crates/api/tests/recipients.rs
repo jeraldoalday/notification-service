@@ -54,6 +54,23 @@ async fn create_recipient_rejects_invalid_address() {
 }
 
 #[tokio::test]
+async fn malformed_json_body_gets_the_error_envelope() {
+    let (app, _dir) = test_app().await;
+
+    let request = axum::http::Request::builder()
+        .method("POST")
+        .uri("/recipients")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from("{not valid json"))
+        .unwrap();
+    let response = send(&app, request).await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = json_body(response).await;
+    assert!(body["error"].is_string(), "expected a JSON error envelope, got {body:?}");
+}
+
+#[tokio::test]
 async fn get_unknown_recipient_is_404() {
     let (app, _dir) = test_app().await;
 

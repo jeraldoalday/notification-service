@@ -9,7 +9,7 @@ use ns_storage::{NotificationRepository, RecipientRepository};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::error::ApiResult;
+use crate::error::{ApiJson, ApiResult};
 use crate::state::AppState;
 
 /// Applied when a `GET /notifications` request omits `limit`, so an
@@ -70,7 +70,7 @@ impl From<Notification> for NotificationResponse {
 
 pub async fn submit_notification<R>(
     State(state): State<AppState<R>>,
-    Json(request): Json<SubmitNotificationRequest>,
+    ApiJson(request): ApiJson<SubmitNotificationRequest>,
 ) -> ApiResult<(StatusCode, Json<NotificationResponse>)>
 where
     R: NotificationRepository + RecipientRepository + Clone,
