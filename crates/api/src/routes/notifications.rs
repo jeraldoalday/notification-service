@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use axum::extract::{Path, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use chrono::{DateTime, Utc};
@@ -11,6 +11,11 @@ use uuid::Uuid;
 
 use crate::error::ApiResult;
 use crate::state::AppState;
+
+/// Applied when a `GET /notifications` request omits `limit`, so an
+/// unbounded query can't be used to pull an entire tenant's history in one
+/// request.
+const DEFAULT_LIST_LIMIT: u32 = 50;
 
 #[derive(Debug, Deserialize)]
 pub struct SubmitNotificationRequest {
@@ -127,4 +132,25 @@ where
     notification.transition(DeliveryStatus::Cancelled, Utc::now())?;
     state.repo.update_notification(&notification).await?;
     Ok(Json(notification.into()))
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListNotificationsQuery {
+    pub tenant_id: Uuid,
+    pub status: Option<DeliveryStatus>,
+    pub limit: Option<u32>,
+}
+
+pub async fn list_notifications<R>(
+    State(state): State<AppState<R>>,
+    Query(query): Query<ListNotificationsQuery>,
+) -> ApiResult<Json<Vec<NotificationResponse>>>
+where
+    R: NotificationRepository + RecipientRepository + Clone,
+{
+    let notifications = state
+        .repo
+        .list_by_tenant(query.tenant_id, query.status, query.limit.unwrap_or(DEFAULT_LIST_LIMIT))
+        .await?;
+    Ok(Json(notifications.into_iter().map(NotificationResponse::from).collect()))
 }

@@ -148,6 +148,77 @@ async fn cancelling_an_unknown_notification_is_404() {
 }
 
 #[tokio::test]
+async fn lists_notifications_for_a_tenant() {
+    let (app, _dir) = test_app().await;
+    let recipient_id = create_recipient(&app).await;
+    let tenant_id = "22222222-2222-2222-2222-222222222222";
+    let other_tenant_id = "33333333-3333-3333-3333-333333333333";
+
+    for tenant in [tenant_id, tenant_id, other_tenant_id] {
+        let submit = post_json(
+            "/notifications",
+            json!({
+                "tenant_id": tenant,
+                "recipient_id": recipient_id,
+                "channel": "email",
+                "body": "hi"
+            }),
+        );
+        send(&app, submit).await;
+    }
+
+    let response = send(&app, get(&format!("/notifications?tenant_id={tenant_id}"))).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let listed: Value = json_body(response).await;
+    assert_eq!(listed.as_array().unwrap().len(), 2);
+    for notification in listed.as_array().unwrap() {
+        assert_eq!(notification["tenant_id"], tenant_id);
+    }
+}
+
+#[tokio::test]
+async fn lists_notifications_filtered_by_status() {
+    let (app, _dir) = test_app().await;
+    let recipient_id = create_recipient(&app).await;
+    let tenant_id = "44444444-4444-4444-4444-444444444444";
+
+    let submit = post_json(
+        "/notifications",
+        json!({
+            "tenant_id": tenant_id,
+            "recipient_id": recipient_id,
+            "channel": "email",
+            "body": "hi"
+        }),
+    );
+    let created: Value = json_body(send(&app, submit).await).await;
+    let id = created["id"].as_str().unwrap();
+    send(&app, post_json(&format!("/notifications/{id}/cancel"), json!({}))).await;
+
+    let queued = json_body::<Value>(
+        send(&app, get(&format!("/notifications?tenant_id={tenant_id}&status=queued"))).await,
+    )
+    .await;
+    assert_eq!(queued.as_array().unwrap().len(), 0);
+
+    let cancelled = json_body::<Value>(
+        send(&app, get(&format!("/notifications?tenant_id={tenant_id}&status=cancelled"))).await,
+    )
+    .await;
+    assert_eq!(cancelled.as_array().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn list_notifications_requires_tenant_id() {
+    let (app, _dir) = test_app().await;
+
+    let response = send(&app, get("/notifications")).await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
 async fn submitted_notification_defaults_to_normal_priority_and_five_attempts() {
     let (app, _dir) = test_app().await;
     let recipient_id = create_recipient(&app).await;

@@ -20,7 +20,10 @@ where
         .route("/health", get(health::health))
         .route("/recipients", post(recipients::create_recipient))
         .route("/recipients/{id}", get(recipients::get_recipient))
-        .route("/notifications", post(notifications::submit_notification))
+        .route(
+            "/notifications",
+            post(notifications::submit_notification).get(notifications::list_notifications),
+        )
         .route("/notifications/{id}", get(notifications::get_notification))
         .route("/notifications/{id}/cancel", post(notifications::cancel_notification))
         .with_state(state)
