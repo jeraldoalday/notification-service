@@ -60,8 +60,18 @@ so each concern can be tested and evolved independently:
   non-2xx/provider-side rejection, and `ChannelError::Transport` if the
   request never completed -- distinctions the planned `ns-worker` can use
   to decide how to react to a failed send.
-- **`ns-api`** (planned) -- an `axum` HTTP API for submitting notifications,
-  querying delivery status, and managing templates.
+- **`ns-api`** -- an `axum` HTTP API for submitting notifications and
+  querying delivery status: `POST /notifications` builds a `Notification`
+  through `ns-core`'s own builder (so validation stays in one place) after
+  checking the recipient exists, then hands it to
+  `NotificationQueue::submit`; `POST /notifications/{id}/cancel` is just
+  another `DeliveryStatus` transition, so it reuses
+  `Notification::transition` rather than adding bespoke cancellation logic.
+  `AppState<R>` is generic over the repository traits, mirroring
+  `ns-worker::Worker<R>`, and `ApiError` maps `ns-core`/`ns-queue`/
+  `ns-storage` errors onto HTTP status codes (400/404/409/422/500) so
+  handlers can just `?`-propagate rather than hand-rolling status mapping
+  per endpoint. Template management is still planned.
 - **`ns-worker`** -- dequeues due notifications via `ns-queue::claim_batch`
   and dispatches each to the `ns-channels` implementation matching its
   `ChannelKind`, looked up through a `ChannelRegistry` built at startup from
@@ -117,7 +127,8 @@ This file is updated as each part lands. Currently implemented:
 - [x] Channel providers (email, SMS, push, webhook)
 - [x] Worker process (`ns-worker`)
 - [x] Rate limiting / circuit breaker (per-channel token bucket + breaker)
-- [ ] HTTP API
+- [x] HTTP API (`ns-api`): recipients, submit/get/list/cancel notifications
+- [ ] Notification templates
 - [ ] Observability (metrics, tracing)
 - [ ] Admin CLI
 - [ ] Auth & multi-tenancy

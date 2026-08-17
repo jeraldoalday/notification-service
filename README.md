@@ -11,8 +11,8 @@ overall design and current build status.
 ## Status
 
 Early and under active development. The domain model, configuration layer,
-SQLite storage layer, job queue, channel providers, and worker process are
-in place; the HTTP API is being built out next.
+SQLite storage layer, job queue, channel providers, worker process, and a
+first cut of the HTTP API are in place.
 
 ## Workspace layout
 
@@ -24,10 +24,38 @@ crates/
   queue/    ns-queue    -- job queue: submit, claim-for-processing, complete/fail with backoff
   channels/ ns-channels -- email, SMS, push, and webhook delivery behind a shared trait
   worker/   ns-worker   -- dequeues due notifications and dispatches them, with per-channel rate limiting and circuit breaking
+  api/      ns-api      -- axum HTTP API for submitting notifications and querying delivery status
 ```
 
-More crates (`api`, `cli`) will be added as they're built; see
-ARCHITECTURE.md for the roadmap.
+The `cli` crate will be added as it's built; see ARCHITECTURE.md for the
+roadmap.
+
+## Running the API
+
+```sh
+cargo run -p ns-api --bin serve
+```
+
+Loads settings the same way as the rest of the service (see
+[Configuration](#configuration) below), connects to the configured SQLite
+database, and serves on `NS_SERVER_HOST:NS_SERVER_PORT` (default
+`127.0.0.1:8080`). Endpoints:
+
+| Method | Path                        | Description                                   |
+| ------ | --------------------------- | ---------------------------------------------- |
+| GET    | `/health`                   | Liveness check                                 |
+| POST   | `/recipients`                | Register a recipient and its channel addresses |
+| GET    | `/recipients/{id}`           | Fetch a recipient                              |
+| POST   | `/notifications`             | Submit a notification (queues it for delivery) |
+| GET    | `/notifications/{id}`        | Fetch a notification's current status          |
+| GET    | `/notifications?tenant_id=`  | List a tenant's notifications, newest-first    |
+| POST   | `/notifications/{id}/cancel` | Cancel a notification that hasn't started sending |
+
+Errors are returned as `{"error": "..."}` with an appropriate status code --
+`400` for validation failures (including malformed JSON), `404` for unknown
+ids, `409` for an illegal status transition (e.g. cancelling a notification
+that's already `Sending`), `422` for a recipient missing an address for the
+requested channel.
 
 ## Running the worker
 
