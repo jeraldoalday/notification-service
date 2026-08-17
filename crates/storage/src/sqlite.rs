@@ -168,6 +168,48 @@ impl NotificationRepository for SqliteStorage {
             })
             .collect()
     }
+
+    async fn list_by_tenant(
+        &self,
+        tenant_id: Uuid,
+        status: Option<DeliveryStatus>,
+        limit: u32,
+    ) -> StorageResult<Vec<Notification>> {
+        let rows = match status {
+            Some(status) => {
+                sqlx::query(
+                    "SELECT data FROM notifications
+                     WHERE tenant_id = ? AND status = ?
+                     ORDER BY created_at DESC
+                     LIMIT ?",
+                )
+                .bind(tenant_id.to_string())
+                .bind(status_str(status))
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?
+            }
+            None => {
+                sqlx::query(
+                    "SELECT data FROM notifications
+                     WHERE tenant_id = ?
+                     ORDER BY created_at DESC
+                     LIMIT ?",
+                )
+                .bind(tenant_id.to_string())
+                .bind(limit as i64)
+                .fetch_all(&self.pool)
+                .await?
+            }
+        };
+
+        rows.into_iter()
+            .map(|row| {
+                let data: String = row.try_get("data")?;
+                Ok(serde_json::from_str(&data)?)
+            })
+            .collect()
+    }
 }
 
 #[async_trait]
@@ -393,5 +435,84 @@ mod tests {
         let mut n = sample_notification();
         n.id = id;
         n
+    }
+
+    #[tokio::test]
+    async fn list_by_tenant_filters_out_other_tenants() {
+        let (storage, _dir) = test_storage().await;
+        let tenant_a = Uuid::new_v4();
+        let tenant_b = Uuid::new_v4();
+
+        let mut n = Notification::builder(tenant_a, Uuid::new_v4(), ChannelKind::Email)
+            .body("for a")
+            .build()
+            .unwrap();
+        n.tenant_id = tenant_a;
+        storage.insert_notification(&n).await.unwrap();
+
+        let mut other = Notification::builder(tenant_b, Uuid::new_v4(), ChannelKind::Email)
+            .body("for b")
+            .build()
+            .unwrap();
+        other.tenant_id = tenant_b;
+        storage.insert_notification(&other).await.unwrap();
+
+        let listed = storage.list_by_tenant(tenant_a, None, 10).await.unwrap();
+
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, n.id);
+    }
+
+    #[tokio::test]
+    async fn list_by_tenant_filters_by_status_when_given() {
+        let (storage, _dir) = test_storage().await;
+        let tenant_id = Uuid::new_v4();
+        let now = Utc::now();
+
+        let mut pending = Notification::builder(tenant_id, Uuid::new_v4(), ChannelKind::Email)
+            .body("pending")
+            .build()
+            .unwrap();
+        pending.tenant_id = tenant_id;
+        storage.insert_notification(&pending).await.unwrap();
+
+        let mut queued = Notification::builder(tenant_id, Uuid::new_v4(), ChannelKind::Email)
+            .body("queued")
+            .build()
+            .unwrap();
+        queued.tenant_id = tenant_id;
+        queued.transition(DeliveryStatus::Queued, now).unwrap();
+        storage.insert_notification(&queued).await.unwrap();
+
+        let listed = storage.list_by_tenant(tenant_id, Some(DeliveryStatus::Queued), 10).await.unwrap();
+
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, queued.id);
+    }
+
+    #[tokio::test]
+    async fn list_by_tenant_orders_newest_first_and_respects_limit() {
+        let (storage, _dir) = test_storage().await;
+        let tenant_id = Uuid::new_v4();
+        let now = Utc::now();
+
+        let mut ids = Vec::new();
+        for i in 0..3 {
+            let mut n = Notification::builder(tenant_id, Uuid::new_v4(), ChannelKind::Email)
+                .body(format!("body {i}"))
+                .build()
+                .unwrap();
+            n.tenant_id = tenant_id;
+            n.created_at = now + Duration::seconds(i);
+            n.updated_at = n.created_at;
+            ids.push(n.id);
+            storage.insert_notification(&n).await.unwrap();
+        }
+
+        let listed = storage.list_by_tenant(tenant_id, None, 2).await.unwrap();
+
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].id, ids[2]);
+        assert_eq!(listed[1].id, ids[1]);
     }
 }

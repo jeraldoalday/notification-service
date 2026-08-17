@@ -44,6 +44,17 @@ pub trait NotificationRepository: Send + Sync {
     /// (or is unset), ordered highest-priority-first and oldest-first
     /// within a priority tier, capped at `limit`.
     async fn due_for_delivery(&self, now: DateTime<Utc>, limit: u32) -> StorageResult<Vec<Notification>>;
+
+    /// Notifications belonging to `tenant_id`, optionally narrowed to a
+    /// single `status`, newest-first, capped at `limit`. Backed by
+    /// `idx_notifications_tenant` (plus the `status` column already indexed
+    /// for `due_for_delivery` when a status filter is supplied).
+    async fn list_by_tenant(
+        &self,
+        tenant_id: Uuid,
+        status: Option<DeliveryStatus>,
+        limit: u32,
+    ) -> StorageResult<Vec<Notification>>;
 }
 
 /// Persistence for `Recipient`s.
