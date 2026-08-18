@@ -23,6 +23,9 @@ pub enum StorageError {
     #[error("migration error: {0}")]
     Migration(#[from] sqlx::migrate::MigrateError),
 
+    #[error("stored notification has unknown status `{0}`")]
+    UnknownStatus(String),
+
     #[error("failed to (de)serialize stored record: {0}")]
     Serialization(#[from] serde_json::Error),
 }

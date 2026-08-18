@@ -21,6 +21,26 @@ pub enum DeliveryStatus {
 }
 
 impl DeliveryStatus {
+    /// Every status, in lifecycle order. Reporting code (the admin CLI's
+    /// queue summary) iterates this so its output has a stable, meaningful
+    /// order instead of whatever a hash map happened to yield.
+    pub fn all() -> [DeliveryStatus; 7] {
+        use DeliveryStatus::*;
+        [Pending, Queued, Sending, Delivered, Failed, DeadLettered, Cancelled]
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            DeliveryStatus::Pending => "pending",
+            DeliveryStatus::Queued => "queued",
+            DeliveryStatus::Sending => "sending",
+            DeliveryStatus::Delivered => "delivered",
+            DeliveryStatus::Failed => "failed",
+            DeliveryStatus::DeadLettered => "dead_lettered",
+            DeliveryStatus::Cancelled => "cancelled",
+        }
+    }
+
     /// Terminal states never transition further.
     pub fn is_terminal(&self) -> bool {
         matches!(self, DeliveryStatus::Delivered | DeliveryStatus::DeadLettered | DeliveryStatus::Cancelled)
@@ -50,10 +70,40 @@ impl DeliveryStatus {
     }
 }
 
+impl std::fmt::Display for DeliveryStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.as_str())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use DeliveryStatus::*;
+
+    #[test]
+    fn all_lists_every_status_once() {
+        let all = DeliveryStatus::all();
+        assert_eq!(all.len(), 7);
+        for status in all {
+            assert_eq!(all.iter().filter(|s| **s == status).count(), 1);
+        }
+    }
+
+    #[test]
+    fn as_str_matches_the_serde_representation() {
+        for status in DeliveryStatus::all() {
+            let json = serde_json::to_string(&status).unwrap();
+            assert_eq!(json, format!("\"{}\"", status.as_str()));
+        }
+    }
+
+    #[test]
+    fn display_matches_as_str() {
+        for status in DeliveryStatus::all() {
+            assert_eq!(status.to_string(), status.as_str());
+        }
+    }
 
     #[test]
     fn happy_path_transitions() {

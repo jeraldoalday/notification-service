@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use ns_core::{DeliveryStatus, Notification, Recipient};
@@ -56,6 +58,13 @@ pub trait NotificationRepository: Send + Sync {
         status: Option<DeliveryStatus>,
         limit: u32,
     ) -> StorageResult<Vec<Notification>>;
+
+    /// How many notifications sit in each status, optionally narrowed to
+    /// one tenant. Statuses with no rows are absent from the map rather
+    /// than present as zero -- callers that want a full table iterate
+    /// `DeliveryStatus::all()` and default the gaps, which keeps the
+    /// aggregate query a plain `GROUP BY`.
+    async fn count_by_status(&self, tenant_id: Option<Uuid>) -> StorageResult<HashMap<DeliveryStatus, u64>>;
 }
 
 /// Persistence for `Recipient`s.

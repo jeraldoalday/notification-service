@@ -96,9 +96,12 @@ fn status_for_storage(err: &StorageError) -> StatusCode {
         StorageError::TemplateNotFound { .. } => StatusCode::NOT_FOUND,
         StorageError::TemplateAlreadyExists { .. } => StatusCode::CONFLICT,
         StorageError::NotificationNotFound(_) | StorageError::RecipientNotFound(_) => StatusCode::NOT_FOUND,
-        StorageError::Database(_) | StorageError::Migration(_) | StorageError::Serialization(_) => {
-            StatusCode::INTERNAL_SERVER_ERROR
-        }
+        // UnknownStatus means a row this service wrote can no longer be
+        // read back, which is a server-side problem, not a bad request.
+        StorageError::Database(_)
+        | StorageError::Migration(_)
+        | StorageError::Serialization(_)
+        | StorageError::UnknownStatus(_) => StatusCode::INTERNAL_SERVER_ERROR,
     }
 }
 

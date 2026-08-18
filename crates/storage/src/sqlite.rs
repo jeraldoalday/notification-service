@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::str::FromStr;
 
 use async_trait::async_trait;
@@ -55,6 +56,15 @@ fn status_str(status: DeliveryStatus) -> &'static str {
         DeliveryStatus::DeadLettered => "dead_lettered",
         DeliveryStatus::Cancelled => "cancelled",
     }
+}
+
+/// Inverse of `status_str`, for reading the indexed `status` column back
+/// in aggregate queries where there's no `data` blob to deserialize.
+fn status_from_str(value: &str) -> StorageResult<DeliveryStatus> {
+    DeliveryStatus::all()
+        .into_iter()
+        .find(|status| status.as_str() == value)
+        .ok_or_else(|| StorageError::UnknownStatus(value.to_string()))
 }
 
 /// Fixed-width, zero-padded RFC 3339 so that lexical string ordering (used
@@ -210,6 +220,34 @@ impl NotificationRepository for SqliteStorage {
                 Ok(serde_json::from_str(&data)?)
             })
             .collect()
+    }
+
+    async fn count_by_status(&self, tenant_id: Option<Uuid>) -> StorageResult<HashMap<DeliveryStatus, u64>> {
+        // Counting off the indexed `status` column rather than loading and
+        // deserializing every row: this is a dashboard query that can span
+        // the whole table.
+        let rows =
+            match tenant_id {
+                Some(tenant_id) => sqlx::query(
+                    "SELECT status, COUNT(*) AS total FROM notifications WHERE tenant_id = ? GROUP BY status",
+                )
+                .bind(tenant_id.to_string())
+                .fetch_all(&self.pool)
+                .await?,
+                None => {
+                    sqlx::query("SELECT status, COUNT(*) AS total FROM notifications GROUP BY status")
+                        .fetch_all(&self.pool)
+                        .await?
+                }
+            };
+
+        let mut counts = HashMap::new();
+        for row in rows {
+            let status: String = row.try_get("status")?;
+            let total: i64 = row.try_get("total")?;
+            counts.insert(status_from_str(&status)?, total as u64);
+        }
+        Ok(counts)
     }
 }
 
@@ -740,5 +778,75 @@ mod tests {
         let (storage, _dir) = test_storage().await;
         let err = storage.delete_template(Uuid::new_v4(), "welcome").await.unwrap_err();
         assert!(matches!(err, StorageError::TemplateNotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn count_by_status_groups_across_tenants() {
+        let (storage, _dir) = test_storage().await;
+        let tenant_id = Uuid::new_v4();
+        let now = Utc::now();
+
+        let mut pending = Notification::builder(tenant_id, Uuid::new_v4(), ChannelKind::Email)
+            .body("pending")
+            .build()
+            .unwrap();
+        pending.tenant_id = tenant_id;
+        storage.insert_notification(&pending).await.unwrap();
+
+        for _ in 0..2 {
+            let mut queued = Notification::builder(tenant_id, Uuid::new_v4(), ChannelKind::Email)
+                .body("queued")
+                .build()
+                .unwrap();
+            queued.transition(DeliveryStatus::Queued, now).unwrap();
+            storage.insert_notification(&queued).await.unwrap();
+        }
+
+        let counts = storage.count_by_status(None).await.unwrap();
+
+        assert_eq!(counts.get(&DeliveryStatus::Pending), Some(&1));
+        assert_eq!(counts.get(&DeliveryStatus::Queued), Some(&2));
+        assert_eq!(counts.get(&DeliveryStatus::Delivered), None, "empty statuses are absent, not zero");
+    }
+
+    #[tokio::test]
+    async fn count_by_status_narrows_to_one_tenant() {
+        let (storage, _dir) = test_storage().await;
+        let mine = Uuid::new_v4();
+
+        let mut ours =
+            Notification::builder(mine, Uuid::new_v4(), ChannelKind::Email).body("ours").build().unwrap();
+        ours.tenant_id = mine;
+        storage.insert_notification(&ours).await.unwrap();
+
+        let mut theirs = Notification::builder(Uuid::new_v4(), Uuid::new_v4(), ChannelKind::Email)
+            .body("theirs")
+            .build()
+            .unwrap();
+        theirs.tenant_id = Uuid::new_v4();
+        storage.insert_notification(&theirs).await.unwrap();
+
+        let counts = storage.count_by_status(Some(mine)).await.unwrap();
+
+        assert_eq!(counts.get(&DeliveryStatus::Pending), Some(&1));
+    }
+
+    #[tokio::test]
+    async fn count_by_status_on_an_empty_table_is_empty() {
+        let (storage, _dir) = test_storage().await;
+        assert!(storage.count_by_status(None).await.unwrap().is_empty());
+    }
+
+    #[test]
+    fn status_str_and_status_from_str_round_trip() {
+        for status in DeliveryStatus::all() {
+            assert_eq!(status_from_str(status_str(status)).unwrap(), status);
+        }
+    }
+
+    #[test]
+    fn status_from_str_rejects_an_unknown_value() {
+        let err = status_from_str("exploded").unwrap_err();
+        assert!(matches!(err, StorageError::UnknownStatus(_)));
     }
 }
