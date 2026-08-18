@@ -238,3 +238,143 @@ async fn submitted_notification_defaults_to_normal_priority_and_five_attempts() 
     assert_eq!(created["max_attempts"], 5);
     assert_eq!(created["attempt_count"], 0);
 }
+
+const TENANT: &str = "11111111-1111-1111-1111-111111111111";
+
+/// Registers a template under `TENANT` that needs one variable.
+async fn create_template(app: &axum::Router, id: &str, channel: Option<&str>) {
+    let mut body = json!({
+        "tenant_id": TENANT,
+        "id": id,
+        "subject": "Welcome, {{name}}",
+        "body": "Hi {{name}}."
+    });
+    if let Some(channel) = channel {
+        body["channel"] = json!(channel);
+    }
+    let response = send(app, post_json("/templates", body)).await;
+    assert_eq!(response.status(), StatusCode::CREATED);
+}
+
+#[tokio::test]
+async fn submits_a_templated_notification() {
+    let (app, _dir) = test_app().await;
+    let recipient_id = create_recipient(&app).await;
+    create_template(&app, "welcome", None).await;
+
+    let response = send(
+        &app,
+        post_json(
+            "/notifications",
+            json!({
+                "tenant_id": TENANT,
+                "recipient_id": recipient_id,
+                "channel": "email",
+                "template_id": "welcome",
+                "template_vars": {"name": "Ada"}
+            }),
+        ),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let created: Value = json_body(response).await;
+    assert_eq!(created["status"], "queued");
+}
+
+#[tokio::test]
+async fn submit_against_an_unknown_template_is_404() {
+    let (app, _dir) = test_app().await;
+    let recipient_id = create_recipient(&app).await;
+
+    let response = send(
+        &app,
+        post_json(
+            "/notifications",
+            json!({
+                "tenant_id": TENANT,
+                "recipient_id": recipient_id,
+                "channel": "email",
+                "template_id": "does_not_exist"
+            }),
+        ),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn submit_without_the_variables_a_template_needs_is_rejected() {
+    let (app, _dir) = test_app().await;
+    let recipient_id = create_recipient(&app).await;
+    create_template(&app, "welcome", None).await;
+
+    let response = send(
+        &app,
+        post_json(
+            "/notifications",
+            json!({
+                "tenant_id": TENANT,
+                "recipient_id": recipient_id,
+                "channel": "email",
+                "template_id": "welcome"
+            }),
+        ),
+    )
+    .await;
+
+    // Caught at submit time rather than after the worker burns every
+    // retry on a notification that could never render.
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    let body: Value = json_body(response).await;
+    assert!(body["error"].as_str().unwrap().contains("name"), "got {body}");
+}
+
+#[tokio::test]
+async fn submit_with_a_template_pinned_to_another_channel_is_rejected() {
+    let (app, _dir) = test_app().await;
+    let recipient_id = create_recipient(&app).await;
+    create_template(&app, "email_only", Some("email")).await;
+
+    let response = send(
+        &app,
+        post_json(
+            "/notifications",
+            json!({
+                "tenant_id": TENANT,
+                "recipient_id": recipient_id,
+                "channel": "sms",
+                "template_id": "email_only",
+                "template_vars": {"name": "Ada"}
+            }),
+        ),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+}
+
+#[tokio::test]
+async fn submit_does_not_resolve_another_tenants_template() {
+    let (app, _dir) = test_app().await;
+    let recipient_id = create_recipient(&app).await;
+    create_template(&app, "welcome", None).await;
+
+    let response = send(
+        &app,
+        post_json(
+            "/notifications",
+            json!({
+                "tenant_id": "22222222-2222-2222-2222-222222222222",
+                "recipient_id": recipient_id,
+                "channel": "email",
+                "template_id": "welcome",
+                "template_vars": {"name": "Ada"}
+            }),
+        ),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}

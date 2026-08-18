@@ -2,7 +2,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
 use ns_core::{Recipient, RecipientAddress};
-use ns_storage::{NotificationRepository, RecipientRepository};
+use ns_storage::{NotificationRepository, RecipientRepository, TemplateRepository};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -38,7 +38,7 @@ pub async fn create_recipient<R>(
     ApiJson(request): ApiJson<CreateRecipientRequest>,
 ) -> ApiResult<(StatusCode, Json<RecipientResponse>)>
 where
-    R: NotificationRepository + RecipientRepository + Clone,
+    R: NotificationRepository + RecipientRepository + TemplateRepository + Clone,
 {
     let mut recipient = Recipient::new(Uuid::new_v4());
     if let Some(name) = request.display_name {
@@ -57,7 +57,7 @@ pub async fn get_recipient<R>(
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<RecipientResponse>>
 where
-    R: NotificationRepository + RecipientRepository + Clone,
+    R: NotificationRepository + RecipientRepository + TemplateRepository + Clone,
 {
     let recipient = state.repo.get_recipient(id).await?;
     Ok(Json(recipient.into()))

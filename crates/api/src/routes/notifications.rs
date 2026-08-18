@@ -5,7 +5,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use chrono::{DateTime, Utc};
 use ns_core::{ChannelKind, DeliveryStatus, Notification, Priority};
-use ns_storage::{NotificationRepository, RecipientRepository};
+use ns_storage::{NotificationRepository, RecipientRepository, TemplateRepository};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -68,12 +68,26 @@ impl From<Notification> for NotificationResponse {
     }
 }
 
+/// Submits a notification for delivery.
+///
+/// Both up-front checks exist for the same reason: a notification that
+/// can never be delivered should be rejected here, synchronously, rather
+/// than being accepted, retried on backoff until its attempts run out and
+/// dead-lettered minutes later where nobody is watching. So an unknown
+/// recipient is a 404, and a `template_id` is resolved and test-rendered
+/// against the supplied `template_vars` before the notification is
+/// queued.
+///
+/// The rendered text is deliberately thrown away rather than stored on
+/// the notification: `ns-worker` renders again at send time, so an edit to
+/// the template still reaches everything queued behind it. This is purely
+/// a validity check.
 pub async fn submit_notification<R>(
     State(state): State<AppState<R>>,
     ApiJson(request): ApiJson<SubmitNotificationRequest>,
 ) -> ApiResult<(StatusCode, Json<NotificationResponse>)>
 where
-    R: NotificationRepository + RecipientRepository + Clone,
+    R: NotificationRepository + RecipientRepository + TemplateRepository + Clone,
 {
     // Fail fast with a 404 rather than letting a bad recipient_id surface
     // only once the worker tries (and fails) to dispatch the notification.
@@ -101,6 +115,12 @@ where
     }
 
     let notification = builder.build()?;
+
+    if let Some(template_id) = &notification.template_id {
+        let template = state.repo.get_template(notification.tenant_id, template_id).await?;
+        template.render_for(&notification)?;
+    }
+
     let submitted = state.queue.submit(notification, Utc::now()).await?;
     Ok((StatusCode::CREATED, Json(submitted.into())))
 }
@@ -110,7 +130,7 @@ pub async fn get_notification<R>(
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<NotificationResponse>>
 where
-    R: NotificationRepository + RecipientRepository + Clone,
+    R: NotificationRepository + RecipientRepository + TemplateRepository + Clone,
 {
     let notification = state.repo.get_notification(id).await?;
     Ok(Json(notification.into()))
@@ -126,7 +146,7 @@ pub async fn cancel_notification<R>(
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<NotificationResponse>>
 where
-    R: NotificationRepository + RecipientRepository + Clone,
+    R: NotificationRepository + RecipientRepository + TemplateRepository + Clone,
 {
     let mut notification = state.repo.get_notification(id).await?;
     notification.transition(DeliveryStatus::Cancelled, Utc::now())?;
@@ -146,7 +166,7 @@ pub async fn list_notifications<R>(
     Query(query): Query<ListNotificationsQuery>,
 ) -> ApiResult<Json<Vec<NotificationResponse>>>
 where
-    R: NotificationRepository + RecipientRepository + Clone,
+    R: NotificationRepository + RecipientRepository + TemplateRepository + Clone,
 {
     let notifications = state
         .repo
