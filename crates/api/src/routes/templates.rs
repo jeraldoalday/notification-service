@@ -13,9 +13,10 @@ use uuid::Uuid;
 use crate::error::{ApiError, ApiJson, ApiResult};
 use crate::state::AppState;
 
-/// Mirrors `DEFAULT_LIST_LIMIT` on the notifications routes: an omitted
-/// `limit` shouldn't mean "everything".
+/// Mirrors the notifications routes: an omitted `limit` shouldn't mean
+/// "everything", and an explicit one shouldn't either.
 const DEFAULT_LIST_LIMIT: u32 = 50;
+const MAX_LIST_LIMIT: u32 = 500;
 
 /// Templates are keyed by (tenant_id, id), so every item route needs the
 /// tenant alongside the id in the path. It rides as a query parameter
@@ -131,8 +132,8 @@ pub async fn list_templates<R>(
 where
     R: NotificationRepository + RecipientRepository + TemplateRepository + Clone,
 {
-    let templates =
-        state.repo.list_templates(query.tenant_id, query.limit.unwrap_or(DEFAULT_LIST_LIMIT)).await?;
+    let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT).min(MAX_LIST_LIMIT);
+    let templates = state.repo.list_templates(query.tenant_id, limit).await?;
     templates.into_iter().map(to_response).collect::<ApiResult<Vec<_>>>().map(Json)
 }
 

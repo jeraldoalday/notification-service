@@ -266,3 +266,15 @@ async fn preview_reports_every_missing_variable_at_once() {
     let message = body["error"].as_str().unwrap();
     assert!(message.contains("name") && message.contains("product"), "got {message}");
 }
+
+#[tokio::test]
+async fn list_limit_is_capped() {
+    let (app, _dir) = test_app().await;
+    let tenant_id = seed_template(&app, "welcome").await;
+
+    let response = send(&app, get(&format!("/templates?tenant_id={tenant_id}&limit=100000"))).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let listed: Value = json_body(response).await;
+    assert_eq!(listed.as_array().unwrap().len(), 1);
+}

@@ -378,3 +378,33 @@ async fn submit_does_not_resolve_another_tenants_template() {
 
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
+
+#[tokio::test]
+async fn list_limit_is_capped() {
+    let (app, _dir) = test_app().await;
+    let recipient_id = create_recipient(&app).await;
+    for _ in 0..3 {
+        send(
+            &app,
+            post_json(
+                "/notifications",
+                json!({
+                    "tenant_id": TENANT,
+                    "recipient_id": recipient_id,
+                    "channel": "email",
+                    "body": "hi"
+                }),
+            ),
+        )
+        .await;
+    }
+
+    // A limit far above the ceiling still answers -- clamped, not
+    // rejected -- so a caller paging with an over-large limit keeps
+    // working while the service stays bounded.
+    let response = send(&app, get(&format!("/notifications?tenant_id={TENANT}&limit=100000"))).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let listed: Value = json_body(response).await;
+    assert_eq!(listed.as_array().unwrap().len(), 3);
+}

@@ -17,6 +17,14 @@ use crate::state::AppState;
 /// request.
 const DEFAULT_LIST_LIMIT: u32 = 50;
 
+/// Ceiling on an explicitly requested `limit`. Without one, the default
+/// above only protects callers who forget the parameter -- `?limit=1000000`
+/// still asks the service to deserialize a tenant's entire history into
+/// memory and serialize it into one response. Clamping rather than
+/// rejecting keeps a caller paging with an over-large limit working, just
+/// bounded.
+const MAX_LIST_LIMIT: u32 = 500;
+
 #[derive(Debug, Deserialize)]
 pub struct SubmitNotificationRequest {
     pub tenant_id: Uuid,
@@ -168,9 +176,7 @@ pub async fn list_notifications<R>(
 where
     R: NotificationRepository + RecipientRepository + TemplateRepository + Clone,
 {
-    let notifications = state
-        .repo
-        .list_by_tenant(query.tenant_id, query.status, query.limit.unwrap_or(DEFAULT_LIST_LIMIT))
-        .await?;
+    let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT).min(MAX_LIST_LIMIT);
+    let notifications = state.repo.list_by_tenant(query.tenant_id, query.status, limit).await?;
     Ok(Json(notifications.into_iter().map(NotificationResponse::from).collect()))
 }
