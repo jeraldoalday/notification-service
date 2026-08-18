@@ -37,6 +37,10 @@ pub enum Command {
     #[command(subcommand)]
     Notification(NotificationCommand),
 
+    /// Register and inspect recipients.
+    #[command(subcommand)]
+    Recipient(RecipientCommand),
+
     /// Manage reusable notification templates.
     #[command(subcommand)]
     Template(TemplateCommand),
@@ -44,6 +48,31 @@ pub enum Command {
     /// Inspect and operate on the delivery queue.
     #[command(subcommand)]
     Queue(QueueCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RecipientCommand {
+    /// Register a recipient and the addresses it can be reached on.
+    Add {
+        #[arg(long)]
+        display_name: Option<String>,
+
+        #[arg(long)]
+        email: Option<String>,
+
+        /// E.164 phone number, e.g. +15555550100.
+        #[arg(long)]
+        phone: Option<String>,
+
+        #[arg(long)]
+        push_token: Option<String>,
+
+        #[arg(long)]
+        webhook_url: Option<String>,
+    },
+
+    /// Show one recipient.
+    Show { id: Uuid },
 }
 
 #[derive(Debug, Subcommand)]

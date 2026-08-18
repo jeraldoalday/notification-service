@@ -1,6 +1,6 @@
 use clap::Parser;
 use ns_cli::cli::{Cli, Command, NotificationCommand, SubmitArgs};
-use ns_cli::cli::{QueueCommand, TemplateCommand, TemplateSaveArgs};
+use ns_cli::cli::{QueueCommand, RecipientCommand, TemplateCommand, TemplateSaveArgs};
 use ns_cli::commands;
 use ns_cli::commands::notification::parse_timestamp;
 use ns_cli::error::CliResult;
@@ -38,6 +38,13 @@ async fn run() -> CliResult<()> {
         }
         Command::Notification(NotificationCommand::Replay { id }) => {
             commands::notification::replay(&storage, id, cli.output).await?
+        }
+        Command::Recipient(RecipientCommand::Add { display_name, email, phone, push_token, webhook_url }) => {
+            let args = commands::recipient::AddArgs { display_name, email, phone, push_token, webhook_url };
+            commands::recipient::add(&storage, args, cli.output).await?
+        }
+        Command::Recipient(RecipientCommand::Show { id }) => {
+            commands::recipient::show(&storage, id, cli.output).await?
         }
         Command::Template(TemplateCommand::Create(args)) => {
             commands::template::create(&storage, template_args(args), cli.output).await?
