@@ -10,6 +10,7 @@ pub mod cli;
 pub mod commands;
 pub mod error;
 pub mod output;
+pub mod parse;
 
 pub use cli::{Cli, Command};
 pub use error::{CliError, CliResult};
