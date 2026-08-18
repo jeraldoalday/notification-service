@@ -1367,6 +1367,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "ns-templates"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "ns-core",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "ns-worker"
 version = "0.1.0"
 dependencies = [
