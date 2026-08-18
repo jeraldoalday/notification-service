@@ -1,6 +1,6 @@
 use clap::Parser;
-use ns_cli::cli::QueueCommand;
 use ns_cli::cli::{Cli, Command, NotificationCommand, SubmitArgs};
+use ns_cli::cli::{QueueCommand, TemplateCommand, TemplateSaveArgs};
 use ns_cli::commands;
 use ns_cli::commands::notification::parse_timestamp;
 use ns_cli::error::CliResult;
@@ -39,6 +39,24 @@ async fn run() -> CliResult<()> {
         Command::Notification(NotificationCommand::Replay { id }) => {
             commands::notification::replay(&storage, id, cli.output).await?
         }
+        Command::Template(TemplateCommand::Create(args)) => {
+            commands::template::create(&storage, template_args(args), cli.output).await?
+        }
+        Command::Template(TemplateCommand::Update(args)) => {
+            commands::template::update(&storage, template_args(args), cli.output).await?
+        }
+        Command::Template(TemplateCommand::Show { tenant, id }) => {
+            commands::template::show(&storage, tenant, &id, cli.output).await?
+        }
+        Command::Template(TemplateCommand::List { tenant, limit }) => {
+            commands::template::list(&storage, tenant, limit, cli.output).await?
+        }
+        Command::Template(TemplateCommand::Delete { tenant, id }) => {
+            commands::template::delete(&storage, tenant, &id, cli.output).await?
+        }
+        Command::Template(TemplateCommand::Render { tenant, id, vars }) => {
+            commands::template::render(&storage, tenant, &id, vars.into_iter().collect(), cli.output).await?
+        }
         Command::Queue(QueueCommand::Stats { tenant }) => {
             commands::queue::stats(&storage, tenant, cli.output).await?
         }
@@ -46,6 +64,18 @@ async fn run() -> CliResult<()> {
 
     print!("{rendered}");
     Ok(())
+}
+
+fn template_args(args: TemplateSaveArgs) -> commands::template::SaveArgs {
+    commands::template::SaveArgs {
+        tenant_id: args.tenant,
+        id: args.id,
+        name: args.name,
+        channel: args.channel,
+        subject: args.subject,
+        body: args.body,
+        body_file: args.body_file,
+    }
 }
 
 /// Translates the parsed command line into the shape the command layer

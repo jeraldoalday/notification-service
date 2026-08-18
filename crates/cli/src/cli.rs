@@ -37,9 +37,84 @@ pub enum Command {
     #[command(subcommand)]
     Notification(NotificationCommand),
 
+    /// Manage reusable notification templates.
+    #[command(subcommand)]
+    Template(TemplateCommand),
+
     /// Inspect and operate on the delivery queue.
     #[command(subcommand)]
     Queue(QueueCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TemplateCommand {
+    /// Store a new template.
+    Create(TemplateSaveArgs),
+
+    /// Replace an existing template's content.
+    Update(TemplateSaveArgs),
+
+    /// Show one template in full.
+    Show {
+        #[arg(long)]
+        tenant: Uuid,
+        id: String,
+    },
+
+    /// List a tenant's templates.
+    List {
+        #[arg(long)]
+        tenant: Uuid,
+
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+    },
+
+    /// Delete a template.
+    Delete {
+        #[arg(long)]
+        tenant: Uuid,
+        id: String,
+    },
+
+    /// Render a template locally, without sending anything.
+    Render {
+        #[arg(long)]
+        tenant: Uuid,
+        id: String,
+
+        /// A template variable, as name=value. Repeat for each one.
+        #[arg(long = "var", value_parser = parse::key_value)]
+        vars: Vec<(String, String)>,
+    },
+}
+
+#[derive(Debug, Args)]
+pub struct TemplateSaveArgs {
+    #[arg(long)]
+    pub tenant: Uuid,
+
+    /// The template's slug, e.g. welcome_email. Referenced by
+    /// `notification submit --template`.
+    pub id: String,
+
+    #[arg(long)]
+    pub name: Option<String>,
+
+    /// Restrict this template to one channel.
+    #[arg(long, value_parser = parse::channel)]
+    pub channel: Option<ChannelKind>,
+
+    #[arg(long)]
+    pub subject: Option<String>,
+
+    #[arg(long, conflicts_with = "body_file")]
+    pub body: Option<String>,
+
+    /// Read the body from a file, which is the practical option for
+    /// anything multi-line.
+    #[arg(long)]
+    pub body_file: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
