@@ -37,9 +37,9 @@ impl Bucket {
 /// Per-channel token-bucket rate limiter, so a burst against one provider
 /// (e.g. the SMS gateway) can't starve sends to another (e.g. webhooks).
 /// `Worker` consults this before dispatching each claimed notification;
-/// a denied acquire leaves the notification claimed as `Sending` for this
-/// pass, to be retried on the next poll rather than burning a delivery
-/// attempt. Interior mutability (`Mutex`) lets a single `RateLimiter` be
+/// a denied acquire defers the notification back onto the queue after a
+/// short delay without burning a delivery attempt, since no provider was
+/// ever contacted. Interior mutability (`Mutex`) lets a single `RateLimiter` be
 /// shared (typically via `Arc`) across concurrently-running workers
 /// without callers needing `&mut self`.
 #[derive(Default)]

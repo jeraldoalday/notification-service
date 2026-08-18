@@ -50,6 +50,14 @@ impl CircuitBreaker {
         Self { failure_threshold, reset_after, breakers: Mutex::new(HashMap::new()) }
     }
 
+    /// How long a tripped breaker stays open before trialing again.
+    /// `Worker` uses this to decide how far ahead to defer work it
+    /// declined to send, so deferred notifications come back around about
+    /// when the breaker is ready to trial one.
+    pub fn cooldown(&self) -> Duration {
+        self.reset_after
+    }
+
     /// A breaker that never trips, for deployments (or tests) that don't
     /// want this protection.
     pub fn disabled() -> Self {

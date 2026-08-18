@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use ns_core::{DeliveryStatus, Notification};
 use ns_queue::NotificationQueue;
 use ns_storage::{NotificationRepository, RecipientRepository, TemplateRepository};
@@ -11,13 +11,23 @@ use crate::error::{WorkerError, WorkerResult};
 use crate::rate_limit::RateLimiter;
 use crate::registry::ChannelRegistry;
 
+/// How long to hold a rate-limited notification before it becomes
+/// claimable again. Short, because a token bucket refills continuously --
+/// this only needs to be long enough that the next poll doesn't
+/// immediately re-claim the same work and find the bucket still empty.
+const RATE_LIMIT_DEFER: Duration = Duration::seconds(5);
+
 /// What happened to a single claimed notification during one dispatch pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DispatchOutcome {
     Delivered,
-    /// The send failed (or was skipped) and the notification was
-    /// requeued for another attempt after a backoff delay.
+    /// The send failed and the notification was requeued for another
+    /// attempt after a backoff delay.
     Failed,
+    /// No send was attempted -- a guard (rate limiter or circuit breaker)
+    /// declined it -- so the notification went back on the queue with its
+    /// attempt budget intact.
+    Deferred,
     /// The send failed and no attempts remained, so the notification was
     /// dead-lettered.
     DeadLettered,
@@ -127,14 +137,21 @@ impl<R: NotificationRepository + RecipientRepository + Clone> Worker<R> {
             return Ok(outcome_from_status(failed.status));
         }
 
+        // A guard declining a send is not a failed delivery: nothing
+        // reached a provider, so spending one of the notification's
+        // attempts on it would let a provider outage or a sustained burst
+        // dead-letter work that was never actually tried. Both guards
+        // therefore defer rather than fail. The breaker's cooldown is the
+        // natural delay for an open breaker -- the notification comes back
+        // around about when the breaker is ready to trial one.
         if !self.circuit_breaker.allow(notification.channel, now) {
-            let failed = self.queue.fail(notification, now).await?;
-            return Ok(outcome_from_status(failed.status));
+            self.queue.defer(notification, self.circuit_breaker.cooldown(), now).await?;
+            return Ok(DispatchOutcome::Deferred);
         }
 
         if !self.rate_limiter.try_acquire(notification.channel, now) {
-            let failed = self.queue.fail(notification, now).await?;
-            return Ok(outcome_from_status(failed.status));
+            self.queue.defer(notification, RATE_LIMIT_DEFER, now).await?;
+            return Ok(DispatchOutcome::Deferred);
         }
 
         let Some(channel) = self.channels.get(notification.channel) else {
@@ -404,7 +421,7 @@ mod tests {
 
         let outcomes = worker.run_once(10).await.unwrap();
 
-        assert_eq!(outcomes[0].1, DispatchOutcome::Failed);
+        assert_eq!(outcomes[0].1, DispatchOutcome::Deferred);
         assert_eq!(channel.calls.load(Ordering::SeqCst), 0, "channel must not be invoked when rate limited");
     }
 
@@ -434,7 +451,7 @@ mod tests {
 
         let outcomes = worker.run_once(10).await.unwrap();
 
-        assert_eq!(outcomes[0].1, DispatchOutcome::Failed);
+        assert_eq!(outcomes[0].1, DispatchOutcome::Deferred);
         assert_eq!(
             channel.calls.load(Ordering::SeqCst),
             0,
@@ -461,7 +478,9 @@ mod tests {
         let outcomes = worker.run_once(10).await.unwrap();
 
         assert_eq!(outcomes.len(), 3);
-        assert!(outcomes.iter().all(|(_, outcome)| *outcome == DispatchOutcome::Failed));
+        assert_eq!(outcomes[0].1, DispatchOutcome::Failed);
+        assert_eq!(outcomes[1].1, DispatchOutcome::Failed);
+        assert_eq!(outcomes[2].1, DispatchOutcome::Deferred, "the third was never attempted");
         assert_eq!(channel.calls.load(Ordering::SeqCst), 2, "breaker should stop the third send attempt");
     }
 
@@ -655,5 +674,84 @@ mod tests {
 
         assert_eq!(outcomes[0].1, DispatchOutcome::Delivered);
         assert_eq!(channel.last_sent().body, submitted.body);
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_notification_keeps_its_attempt_budget() {
+        let (repo, _dir) = test_repo().await;
+        let recipient_id = seed_recipient(&repo, ChannelKind::Webhook).await;
+        let submitted = seed_notification(&repo, recipient_id, 3).await;
+
+        let registry =
+            ChannelRegistry::new().register(ChannelKind::Webhook, Arc::new(FakeChannel::succeeding()));
+        let rate_limiter = RateLimiter::new().with_limit(ChannelKind::Webhook, 0, 1.0);
+        let worker = Worker::new(repo.clone(), registry, rate_limiter, CircuitBreaker::disabled());
+
+        worker.run_once(10).await.unwrap();
+
+        let stored = repo.get_notification(submitted.id).await.unwrap();
+        assert_eq!(stored.status, DeliveryStatus::Queued);
+        assert_eq!(stored.attempt_count, 0, "no provider was contacted, so no attempt was spent");
+        assert!(stored.scheduled_for.is_some(), "it comes back around after a short delay");
+    }
+
+    #[tokio::test]
+    async fn an_open_breaker_does_not_dead_letter_work_it_never_attempted() {
+        let (repo, _dir) = test_repo().await;
+        let recipient_id = seed_recipient(&repo, ChannelKind::Webhook).await;
+        // One attempt left: under the old behaviour, being denied by the
+        // breaker would have dead-lettered this outright.
+        let submitted = seed_notification(&repo, recipient_id, 1).await;
+
+        let registry =
+            ChannelRegistry::new().register(ChannelKind::Webhook, Arc::new(FakeChannel::succeeding()));
+        let circuit_breaker = CircuitBreaker::new(1, Duration::seconds(60));
+        circuit_breaker.record_failure(ChannelKind::Webhook, Utc::now());
+        let worker = Worker::new(repo.clone(), registry, RateLimiter::new(), circuit_breaker);
+
+        let outcomes = worker.run_once(10).await.unwrap();
+
+        assert_eq!(outcomes[0].1, DispatchOutcome::Deferred);
+        let stored = repo.get_notification(submitted.id).await.unwrap();
+        assert_eq!(stored.status, DeliveryStatus::Queued);
+        assert_eq!(stored.attempt_count, 0);
+    }
+
+    #[tokio::test]
+    async fn deferred_work_is_held_until_the_breaker_cooldown_elapses() {
+        let (repo, _dir) = test_repo().await;
+        let recipient_id = seed_recipient(&repo, ChannelKind::Webhook).await;
+        let submitted = seed_notification(&repo, recipient_id, 3).await;
+
+        let registry =
+            ChannelRegistry::new().register(ChannelKind::Webhook, Arc::new(FakeChannel::succeeding()));
+        let circuit_breaker = CircuitBreaker::new(1, Duration::seconds(60));
+        circuit_breaker.record_failure(ChannelKind::Webhook, Utc::now());
+        let worker = Worker::new(repo.clone(), registry, RateLimiter::new(), circuit_breaker);
+
+        worker.run_once(10).await.unwrap();
+
+        let stored = repo.get_notification(submitted.id).await.unwrap();
+        let scheduled_for = stored.scheduled_for.expect("deferred work is scheduled");
+        assert!(
+            scheduled_for >= stored.updated_at + Duration::seconds(59),
+            "deferral tracks the breaker's own cooldown"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_real_send_failure_still_spends_an_attempt() {
+        let (repo, _dir) = test_repo().await;
+        let recipient_id = seed_recipient(&repo, ChannelKind::Webhook).await;
+        let submitted = seed_notification(&repo, recipient_id, 3).await;
+
+        let registry =
+            ChannelRegistry::new().register(ChannelKind::Webhook, Arc::new(FakeChannel::failing()));
+        let worker = Worker::new(repo.clone(), registry, RateLimiter::new(), CircuitBreaker::disabled());
+
+        worker.run_once(10).await.unwrap();
+
+        let stored = repo.get_notification(submitted.id).await.unwrap();
+        assert_eq!(stored.attempt_count, 1, "deferral must not have softened ordinary failures");
     }
 }
