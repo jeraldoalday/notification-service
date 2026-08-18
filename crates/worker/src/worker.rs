@@ -1,11 +1,13 @@
+use std::sync::Arc;
+
 use chrono::{DateTime, Utc};
 use ns_core::{DeliveryStatus, Notification};
 use ns_queue::NotificationQueue;
-use ns_storage::{NotificationRepository, RecipientRepository};
+use ns_storage::{NotificationRepository, RecipientRepository, TemplateRepository};
 use tracing::{info, warn};
 
 use crate::circuit_breaker::CircuitBreaker;
-use crate::error::WorkerResult;
+use crate::error::{WorkerError, WorkerResult};
 use crate::rate_limit::RateLimiter;
 use crate::registry::ChannelRegistry;
 
@@ -39,6 +41,11 @@ pub struct Worker<R> {
     channels: ChannelRegistry,
     rate_limiter: RateLimiter,
     circuit_breaker: CircuitBreaker,
+    /// Where templated notifications get their text from. Held as a
+    /// separate trait object rather than another bound on `R` so a
+    /// deployment that doesn't use templates -- and every existing
+    /// caller of `Worker::new` -- is unaffected.
+    templates: Option<Arc<dyn TemplateRepository>>,
 }
 
 impl<R: NotificationRepository + RecipientRepository + Clone> Worker<R> {
@@ -48,7 +55,47 @@ impl<R: NotificationRepository + RecipientRepository + Clone> Worker<R> {
         rate_limiter: RateLimiter,
         circuit_breaker: CircuitBreaker,
     ) -> Self {
-        Self { queue: NotificationQueue::new(repo.clone()), repo, channels, rate_limiter, circuit_breaker }
+        Self {
+            queue: NotificationQueue::new(repo.clone()),
+            repo,
+            channels,
+            rate_limiter,
+            circuit_breaker,
+            templates: None,
+        }
+    }
+
+    /// Gives this worker a template store, enabling delivery of
+    /// notifications that carry a `template_id`. Without one, such a
+    /// notification fails (and eventually dead-letters) rather than going
+    /// out with an unrendered body.
+    pub fn with_templates(mut self, templates: Arc<dyn TemplateRepository>) -> Self {
+        self.templates = Some(templates);
+        self
+    }
+
+    /// Replaces a templated notification's subject/body with the rendered
+    /// text. Notifications without a `template_id` pass through untouched,
+    /// so this is a no-op for the common case.
+    ///
+    /// Rendering happens against the template as it exists *now*, not as it
+    /// existed at submit time: editing a template fixes the wording of
+    /// everything still queued behind it, which is the point of having
+    /// templates at all rather than inlining the text into each
+    /// notification.
+    async fn render_if_templated(&self, notification: &mut Notification) -> WorkerResult<()> {
+        let Some(template_id) = notification.template_id.clone() else {
+            return Ok(());
+        };
+
+        let templates = self
+            .templates
+            .as_ref()
+            .ok_or_else(|| WorkerError::TemplatesNotConfigured { template_id: template_id.clone() })?;
+
+        let template = templates.get_template(notification.tenant_id, &template_id).await?;
+        template.render_for(notification)?.apply_to(notification);
+        Ok(())
     }
 
     /// Dispatches a single already-claimed (`Sending`) notification: checks
@@ -67,9 +114,19 @@ impl<R: NotificationRepository + RecipientRepository + Clone> Worker<R> {
     /// address/channel says nothing about the provider's health.
     async fn dispatch_one(
         &self,
-        notification: Notification,
+        mut notification: Notification,
         now: DateTime<Utc>,
     ) -> WorkerResult<DispatchOutcome> {
+        // Rendering runs before the guards on purpose: a message that
+        // can't even be built is never going to reach the provider, so
+        // there's no reason to spend one of that channel's rate-limit
+        // tokens discovering that.
+        if let Err(err) = self.render_if_templated(&mut notification).await {
+            warn!(notification_id = %notification.id, error = %err, "could not render template");
+            let failed = self.queue.fail(notification, now).await?;
+            return Ok(outcome_from_status(failed.status));
+        }
+
         if !self.circuit_breaker.allow(notification.channel, now) {
             let failed = self.queue.fail(notification, now).await?;
             return Ok(outcome_from_status(failed.status));
@@ -175,30 +232,40 @@ mod tests {
     use ns_channels::{ChannelError, ChannelResult, NotificationChannel};
     use ns_core::{ChannelKind, Priority, Recipient, RecipientAddress};
     use ns_storage::SqliteStorage;
+    use ns_storage::TemplateRepository;
+    use ns_templates::Template;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use uuid::Uuid;
 
     #[derive(Default)]
     struct FakeChannel {
         should_succeed: bool,
         calls: AtomicUsize,
+        /// Every notification handed to `send`, so tests can assert on the
+        /// text that actually went out rather than only on the stored row.
+        sent: Mutex<Vec<Notification>>,
     }
 
     impl FakeChannel {
         fn succeeding() -> Self {
-            Self { should_succeed: true, calls: AtomicUsize::new(0) }
+            Self { should_succeed: true, calls: AtomicUsize::new(0), sent: Mutex::default() }
         }
 
         fn failing() -> Self {
-            Self { should_succeed: false, calls: AtomicUsize::new(0) }
+            Self { should_succeed: false, calls: AtomicUsize::new(0), sent: Mutex::default() }
+        }
+
+        fn last_sent(&self) -> Notification {
+            self.sent.lock().unwrap().last().cloned().expect("channel was never invoked")
         }
     }
 
     #[async_trait]
     impl NotificationChannel for FakeChannel {
-        async fn send(&self, _notification: &Notification, _address: &RecipientAddress) -> ChannelResult<()> {
+        async fn send(&self, notification: &Notification, _address: &RecipientAddress) -> ChannelResult<()> {
             self.calls.fetch_add(1, Ordering::SeqCst);
+            self.sent.lock().unwrap().push(notification.clone());
             if self.should_succeed {
                 Ok(())
             } else {
@@ -429,5 +496,164 @@ mod tests {
 
         let stored = repo.get_notification(submitted.id).await.unwrap();
         assert_eq!(stored.status, DeliveryStatus::Delivered);
+    }
+
+    /// Submits a notification that renders through `template_id` instead of
+    /// carrying its own body, returning the tenant it belongs to so the
+    /// test can store a template under the same tenant.
+    async fn seed_templated_notification(
+        repo: &SqliteStorage,
+        recipient_id: Uuid,
+        template_id: &str,
+        vars: &[(&str, &str)],
+    ) -> Notification {
+        let queue = NotificationQueue::new(repo.clone());
+        let mut builder = Notification::builder(Uuid::new_v4(), recipient_id, ChannelKind::Webhook)
+            .template(template_id)
+            .max_attempts(3);
+        for (key, value) in vars {
+            builder = builder.template_var(*key, *value);
+        }
+        queue.submit(builder.build().unwrap(), Utc::now()).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn renders_a_templated_notification_before_sending_it() {
+        let (repo, _dir) = test_repo().await;
+        let recipient_id = seed_recipient(&repo, ChannelKind::Webhook).await;
+        let submitted = seed_templated_notification(&repo, recipient_id, "welcome", &[("name", "Ada")]).await;
+
+        let template = Template::new(submitted.tenant_id, "welcome", "Hi {{name}}, welcome aboard.")
+            .unwrap()
+            .with_subject("Welcome, {{name}}")
+            .unwrap();
+        repo.insert_template(&template).await.unwrap();
+
+        let channel = Arc::new(FakeChannel::succeeding());
+        let registry = ChannelRegistry::new().register(ChannelKind::Webhook, channel.clone());
+        let worker = Worker::new(repo.clone(), registry, RateLimiter::new(), CircuitBreaker::disabled())
+            .with_templates(Arc::new(repo.clone()));
+
+        let outcomes = worker.run_once(10).await.unwrap();
+
+        assert_eq!(outcomes[0].1, DispatchOutcome::Delivered);
+        let sent = channel.last_sent();
+        assert_eq!(sent.body, "Hi Ada, welcome aboard.");
+        assert_eq!(sent.subject.as_deref(), Some("Welcome, Ada"));
+    }
+
+    #[tokio::test]
+    async fn stores_the_rendered_text_on_the_delivered_notification() {
+        let (repo, _dir) = test_repo().await;
+        let recipient_id = seed_recipient(&repo, ChannelKind::Webhook).await;
+        let submitted = seed_templated_notification(&repo, recipient_id, "welcome", &[("name", "Ada")]).await;
+        repo.insert_template(&Template::new(submitted.tenant_id, "welcome", "Hi {{name}}").unwrap())
+            .await
+            .unwrap();
+
+        let registry =
+            ChannelRegistry::new().register(ChannelKind::Webhook, Arc::new(FakeChannel::succeeding()));
+        let worker = Worker::new(repo.clone(), registry, RateLimiter::new(), CircuitBreaker::disabled())
+            .with_templates(Arc::new(repo.clone()));
+
+        worker.run_once(10).await.unwrap();
+
+        let stored = repo.get_notification(submitted.id).await.unwrap();
+        assert_eq!(stored.status, DeliveryStatus::Delivered);
+        assert_eq!(stored.body, "Hi Ada", "the delivered record shows what was actually sent");
+    }
+
+    #[tokio::test]
+    async fn fails_when_the_referenced_template_does_not_exist() {
+        let (repo, _dir) = test_repo().await;
+        let recipient_id = seed_recipient(&repo, ChannelKind::Webhook).await;
+        seed_templated_notification(&repo, recipient_id, "missing", &[]).await;
+
+        let channel = Arc::new(FakeChannel::succeeding());
+        let registry = ChannelRegistry::new().register(ChannelKind::Webhook, channel.clone());
+        let worker = Worker::new(repo.clone(), registry, RateLimiter::new(), CircuitBreaker::disabled())
+            .with_templates(Arc::new(repo.clone()));
+
+        let outcomes = worker.run_once(10).await.unwrap();
+
+        assert_eq!(outcomes[0].1, DispatchOutcome::Failed);
+        assert_eq!(channel.calls.load(Ordering::SeqCst), 0, "nothing sendable was ever built");
+    }
+
+    #[tokio::test]
+    async fn fails_when_a_template_variable_is_missing() {
+        let (repo, _dir) = test_repo().await;
+        let recipient_id = seed_recipient(&repo, ChannelKind::Webhook).await;
+        // The notification supplies no variables at all, but the template
+        // needs one -- better to fail than to send "Hi ".
+        let submitted = seed_templated_notification(&repo, recipient_id, "welcome", &[]).await;
+        repo.insert_template(&Template::new(submitted.tenant_id, "welcome", "Hi {{name}}").unwrap())
+            .await
+            .unwrap();
+
+        let channel = Arc::new(FakeChannel::succeeding());
+        let registry = ChannelRegistry::new().register(ChannelKind::Webhook, channel.clone());
+        let worker = Worker::new(repo.clone(), registry, RateLimiter::new(), CircuitBreaker::disabled())
+            .with_templates(Arc::new(repo.clone()));
+
+        let outcomes = worker.run_once(10).await.unwrap();
+
+        assert_eq!(outcomes[0].1, DispatchOutcome::Failed);
+        assert_eq!(channel.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn fails_a_templated_notification_when_no_template_store_is_configured() {
+        let (repo, _dir) = test_repo().await;
+        let recipient_id = seed_recipient(&repo, ChannelKind::Webhook).await;
+        seed_templated_notification(&repo, recipient_id, "welcome", &[]).await;
+
+        let channel = Arc::new(FakeChannel::succeeding());
+        let registry = ChannelRegistry::new().register(ChannelKind::Webhook, channel.clone());
+        // No .with_templates(..) -- an unrendered body must not go out.
+        let worker = Worker::new(repo.clone(), registry, RateLimiter::new(), CircuitBreaker::disabled());
+
+        let outcomes = worker.run_once(10).await.unwrap();
+
+        assert_eq!(outcomes[0].1, DispatchOutcome::Failed);
+        assert_eq!(channel.calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_render_does_not_consume_a_rate_limit_token() {
+        let (repo, _dir) = test_repo().await;
+        let recipient_id = seed_recipient(&repo, ChannelKind::Webhook).await;
+        // First notification can't render; second is an ordinary one that
+        // should still get the single available token.
+        seed_templated_notification(&repo, recipient_id, "missing", &[]).await;
+        let plain = seed_notification(&repo, recipient_id, 3).await;
+
+        let channel = Arc::new(FakeChannel::succeeding());
+        let registry = ChannelRegistry::new().register(ChannelKind::Webhook, channel.clone());
+        let rate_limiter = RateLimiter::new().with_limit(ChannelKind::Webhook, 1, 0.0);
+        let worker = Worker::new(repo.clone(), registry, rate_limiter, CircuitBreaker::disabled())
+            .with_templates(Arc::new(repo.clone()));
+
+        worker.run_once(10).await.unwrap();
+
+        assert_eq!(channel.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(channel.last_sent().id, plain.id);
+    }
+
+    #[tokio::test]
+    async fn untemplated_notifications_are_unaffected_by_a_template_store() {
+        let (repo, _dir) = test_repo().await;
+        let recipient_id = seed_recipient(&repo, ChannelKind::Webhook).await;
+        let submitted = seed_notification(&repo, recipient_id, 3).await;
+
+        let channel = Arc::new(FakeChannel::succeeding());
+        let registry = ChannelRegistry::new().register(ChannelKind::Webhook, channel.clone());
+        let worker = Worker::new(repo.clone(), registry, RateLimiter::new(), CircuitBreaker::disabled())
+            .with_templates(Arc::new(repo.clone()));
+
+        let outcomes = worker.run_once(10).await.unwrap();
+
+        assert_eq!(outcomes[0].1, DispatchOutcome::Delivered);
+        assert_eq!(channel.last_sent().body, submitted.body);
     }
 }

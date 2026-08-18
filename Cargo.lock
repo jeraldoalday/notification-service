@@ -1390,6 +1390,7 @@ dependencies = [
  "ns-core",
  "ns-queue",
  "ns-storage",
+ "ns-templates",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
