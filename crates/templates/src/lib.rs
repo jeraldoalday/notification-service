@@ -11,5 +11,7 @@
 //! stays free of anything that isn't the delivery domain itself.
 
 pub mod error;
+pub mod render;
 
 pub use error::{TemplateError, TemplateResult};
+pub use render::{missing_variables, placeholders, render, Segment};
