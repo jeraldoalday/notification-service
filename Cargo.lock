@@ -1356,6 +1356,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "ns-core",
+ "ns-templates",
  "serde",
  "serde_json",
  "sqlx",

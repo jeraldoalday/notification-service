@@ -3,12 +3,13 @@ use std::str::FromStr;
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
 use ns_core::{DeliveryStatus, Notification, Recipient};
+use ns_templates::Template;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use sqlx::Row;
 use uuid::Uuid;
 
 use crate::error::{StorageError, StorageResult};
-use crate::repository::{NotificationRepository, RecipientRepository};
+use crate::repository::{NotificationRepository, RecipientRepository, TemplateRepository};
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 
@@ -232,6 +233,103 @@ impl RecipientRepository for SqliteStorage {
             .ok_or(StorageError::RecipientNotFound(id))?;
         let data: String = row.try_get("data")?;
         Ok(serde_json::from_str(&data)?)
+    }
+}
+
+#[async_trait]
+impl TemplateRepository for SqliteStorage {
+    async fn insert_template(&self, template: &Template) -> StorageResult<()> {
+        let data = serde_json::to_string(template)?;
+        let result = sqlx::query(
+            "INSERT INTO templates (tenant_id, id, channel, created_at, updated_at, data)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(template.tenant_id.to_string())
+        .bind(&template.id)
+        .bind(template.channel.map(|c| c.as_str()))
+        .bind(to_ts(template.created_at))
+        .bind(to_ts(template.updated_at))
+        .bind(data)
+        .execute(&self.pool)
+        .await;
+
+        match result {
+            Ok(_) => Ok(()),
+            // The (tenant_id, id) primary key is what makes "already
+            // exists" detectable at all; translating it here means callers
+            // get a domain error instead of having to sniff SQLite's own
+            // constraint message.
+            Err(sqlx::Error::Database(err)) if err.is_unique_violation() => {
+                Err(StorageError::TemplateAlreadyExists {
+                    tenant_id: template.tenant_id,
+                    id: template.id.clone(),
+                })
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    async fn get_template(&self, tenant_id: Uuid, id: &str) -> StorageResult<Template> {
+        let row = sqlx::query("SELECT data FROM templates WHERE tenant_id = ? AND id = ?")
+            .bind(tenant_id.to_string())
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(|| StorageError::TemplateNotFound { tenant_id, id: id.to_string() })?;
+        let data: String = row.try_get("data")?;
+        Ok(serde_json::from_str(&data)?)
+    }
+
+    async fn update_template(&self, template: &Template) -> StorageResult<()> {
+        let data = serde_json::to_string(template)?;
+        let result = sqlx::query(
+            "UPDATE templates SET channel = ?, created_at = ?, updated_at = ?, data = ?
+             WHERE tenant_id = ? AND id = ?",
+        )
+        .bind(template.channel.map(|c| c.as_str()))
+        .bind(to_ts(template.created_at))
+        .bind(to_ts(template.updated_at))
+        .bind(data)
+        .bind(template.tenant_id.to_string())
+        .bind(&template.id)
+        .execute(&self.pool)
+        .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(StorageError::TemplateNotFound {
+                tenant_id: template.tenant_id,
+                id: template.id.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn list_templates(&self, tenant_id: Uuid, limit: u32) -> StorageResult<Vec<Template>> {
+        let rows = sqlx::query("SELECT data FROM templates WHERE tenant_id = ? ORDER BY id ASC LIMIT ?")
+            .bind(tenant_id.to_string())
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let data: String = row.try_get("data")?;
+                Ok(serde_json::from_str(&data)?)
+            })
+            .collect()
+    }
+
+    async fn delete_template(&self, tenant_id: Uuid, id: &str) -> StorageResult<()> {
+        let result = sqlx::query("DELETE FROM templates WHERE tenant_id = ? AND id = ?")
+            .bind(tenant_id.to_string())
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(StorageError::TemplateNotFound { tenant_id, id: id.to_string() });
+        }
+        Ok(())
     }
 }
 
@@ -514,5 +612,133 @@ mod tests {
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0].id, ids[2]);
         assert_eq!(listed[1].id, ids[1]);
+    }
+
+    fn sample_template(tenant_id: Uuid, id: &str) -> Template {
+        Template::new(tenant_id, id, "Hi {{name}}").unwrap().with_subject("Hello").unwrap()
+    }
+
+    #[tokio::test]
+    async fn inserts_and_gets_template() {
+        let (storage, _dir) = test_storage().await;
+        let tenant_id = Uuid::new_v4();
+        let template = sample_template(tenant_id, "welcome");
+
+        storage.insert_template(&template).await.unwrap();
+        let fetched = storage.get_template(tenant_id, "welcome").await.unwrap();
+
+        assert_eq!(fetched, template);
+    }
+
+    #[tokio::test]
+    async fn get_missing_template_errors() {
+        let (storage, _dir) = test_storage().await;
+        let err = storage.get_template(Uuid::new_v4(), "nope").await.unwrap_err();
+        assert!(matches!(err, StorageError::TemplateNotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn inserting_the_same_id_twice_for_one_tenant_conflicts() {
+        let (storage, _dir) = test_storage().await;
+        let tenant_id = Uuid::new_v4();
+        storage.insert_template(&sample_template(tenant_id, "welcome")).await.unwrap();
+
+        let err = storage.insert_template(&sample_template(tenant_id, "welcome")).await.unwrap_err();
+
+        assert!(matches!(err, StorageError::TemplateAlreadyExists { .. }));
+    }
+
+    #[tokio::test]
+    async fn the_same_template_id_is_free_for_another_tenant() {
+        let (storage, _dir) = test_storage().await;
+        let tenant_a = Uuid::new_v4();
+        let tenant_b = Uuid::new_v4();
+
+        storage.insert_template(&sample_template(tenant_a, "welcome")).await.unwrap();
+        storage.insert_template(&sample_template(tenant_b, "welcome")).await.unwrap();
+
+        assert!(storage.get_template(tenant_a, "welcome").await.is_ok());
+        assert!(storage.get_template(tenant_b, "welcome").await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn get_template_does_not_cross_tenants() {
+        let (storage, _dir) = test_storage().await;
+        let owner = Uuid::new_v4();
+        storage.insert_template(&sample_template(owner, "welcome")).await.unwrap();
+
+        let err = storage.get_template(Uuid::new_v4(), "welcome").await.unwrap_err();
+
+        assert!(matches!(err, StorageError::TemplateNotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn update_persists_revised_content() {
+        let (storage, _dir) = test_storage().await;
+        let tenant_id = Uuid::new_v4();
+        let mut template = sample_template(tenant_id, "welcome");
+        storage.insert_template(&template).await.unwrap();
+
+        template.revise(None, "Goodbye {{name}}".into(), Utc::now()).unwrap();
+        storage.update_template(&template).await.unwrap();
+
+        let fetched = storage.get_template(tenant_id, "welcome").await.unwrap();
+        assert_eq!(fetched.body, "Goodbye {{name}}");
+        assert_eq!(fetched.subject, None);
+    }
+
+    #[tokio::test]
+    async fn update_missing_template_errors() {
+        let (storage, _dir) = test_storage().await;
+        let err = storage.update_template(&sample_template(Uuid::new_v4(), "welcome")).await.unwrap_err();
+        assert!(matches!(err, StorageError::TemplateNotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn list_templates_is_tenant_scoped_and_ordered_by_id() {
+        let (storage, _dir) = test_storage().await;
+        let tenant_id = Uuid::new_v4();
+
+        for id in ["welcome", "alert", "receipt"] {
+            storage.insert_template(&sample_template(tenant_id, id)).await.unwrap();
+        }
+        storage.insert_template(&sample_template(Uuid::new_v4(), "someone_elses")).await.unwrap();
+
+        let listed = storage.list_templates(tenant_id, 10).await.unwrap();
+
+        let ids: Vec<&str> = listed.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec!["alert", "receipt", "welcome"]);
+    }
+
+    #[tokio::test]
+    async fn list_templates_respects_limit() {
+        let (storage, _dir) = test_storage().await;
+        let tenant_id = Uuid::new_v4();
+        for id in ["a", "b", "c"] {
+            storage.insert_template(&sample_template(tenant_id, id)).await.unwrap();
+        }
+
+        let listed = storage.list_templates(tenant_id, 2).await.unwrap();
+
+        assert_eq!(listed.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn delete_removes_the_template() {
+        let (storage, _dir) = test_storage().await;
+        let tenant_id = Uuid::new_v4();
+        storage.insert_template(&sample_template(tenant_id, "welcome")).await.unwrap();
+
+        storage.delete_template(tenant_id, "welcome").await.unwrap();
+
+        let err = storage.get_template(tenant_id, "welcome").await.unwrap_err();
+        assert!(matches!(err, StorageError::TemplateNotFound { .. }));
+    }
+
+    #[tokio::test]
+    async fn delete_missing_template_errors() {
+        let (storage, _dir) = test_storage().await;
+        let err = storage.delete_template(Uuid::new_v4(), "welcome").await.unwrap_err();
+        assert!(matches!(err, StorageError::TemplateNotFound { .. }));
     }
 }

@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use ns_core::{DeliveryStatus, Notification, Recipient};
+use ns_templates::Template;
 use uuid::Uuid;
 
 use crate::error::StorageResult;
@@ -63,4 +64,31 @@ pub trait RecipientRepository: Send + Sync {
     async fn insert_recipient(&self, recipient: &Recipient) -> StorageResult<()>;
 
     async fn get_recipient(&self, id: Uuid) -> StorageResult<Recipient>;
+}
+
+/// Persistence for `Template`s.
+///
+/// Every method is keyed by `(tenant_id, id)` rather than by id alone:
+/// template ids are caller-chosen slugs, so `welcome_email` is expected to
+/// exist for many tenants at once and a lookup that forgot the tenant would
+/// silently cross that boundary.
+#[async_trait]
+pub trait TemplateRepository: Send + Sync {
+    /// Stores a new template, failing with
+    /// `StorageError::TemplateAlreadyExists` if the tenant already has one
+    /// with this id. Kept distinct from `update_template` so the API can
+    /// answer "create" and "replace" with different status codes instead of
+    /// letting a POST silently clobber an existing template.
+    async fn insert_template(&self, template: &Template) -> StorageResult<()>;
+
+    async fn get_template(&self, tenant_id: Uuid, id: &str) -> StorageResult<Template>;
+
+    /// Replaces an existing template's stored content, failing with
+    /// `StorageError::TemplateNotFound` if there's nothing to replace.
+    async fn update_template(&self, template: &Template) -> StorageResult<()>;
+
+    /// A tenant's templates ordered by id, capped at `limit`.
+    async fn list_templates(&self, tenant_id: Uuid, limit: u32) -> StorageResult<Vec<Template>>;
+
+    async fn delete_template(&self, tenant_id: Uuid, id: &str) -> StorageResult<()>;
 }

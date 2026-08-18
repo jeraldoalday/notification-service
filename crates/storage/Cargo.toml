@@ -8,6 +8,7 @@ description = "Persistence layer for the notification service"
 
 [dependencies]
 ns-core = { path = "../core" }
+ns-templates = { path = "../templates" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true

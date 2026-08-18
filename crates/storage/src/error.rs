@@ -11,6 +11,12 @@ pub enum StorageError {
     #[error("recipient {0} not found")]
     RecipientNotFound(Uuid),
 
+    #[error("template `{id}` not found for tenant {tenant_id}")]
+    TemplateNotFound { tenant_id: Uuid, id: String },
+
+    #[error("template `{id}` already exists for tenant {tenant_id}")]
+    TemplateAlreadyExists { tenant_id: Uuid, id: String },
+
     #[error("database error: {0}")]
     Database(#[from] sqlx::Error),
 
