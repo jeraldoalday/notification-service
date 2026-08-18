@@ -77,21 +77,26 @@ pub async fn list(
     output: OutputFormat,
 ) -> CliResult<String> {
     let notifications = storage.list_by_tenant(tenant_id, status, limit).await?;
-    output.render(&notifications, || {
-        let rows: Vec<Vec<String>> = notifications
-            .iter()
-            .map(|n| {
-                vec![
-                    n.id.to_string(),
-                    n.channel.to_string(),
-                    n.status.to_string(),
-                    format!("{}/{}", n.attempt_count, n.max_attempts),
-                    n.created_at.to_rfc3339(),
-                ]
-            })
-            .collect();
-        table(&["id", "channel", "status", "attempts", "created"], &rows)
-    })
+    output.render(&notifications, || summary_table(&notifications))
+}
+
+/// The one-line-per-notification listing shared by `notification list` and
+/// `queue due`, so the two can't drift into showing different columns for
+/// the same rows.
+pub fn summary_table(notifications: &[Notification]) -> String {
+    let rows: Vec<Vec<String>> = notifications
+        .iter()
+        .map(|n| {
+            vec![
+                n.id.to_string(),
+                n.channel.to_string(),
+                n.status.to_string(),
+                format!("{}/{}", n.attempt_count, n.max_attempts),
+                n.created_at.to_rfc3339(),
+            ]
+        })
+        .collect();
+    table(&["id", "channel", "status", "attempts", "created"], &rows)
 }
 
 /// Cancels a notification that hasn't started sending. The refusal comes

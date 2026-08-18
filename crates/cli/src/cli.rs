@@ -224,4 +224,19 @@ pub enum QueueCommand {
         #[arg(long)]
         tenant: Option<Uuid>,
     },
+
+    /// Show the work the next worker poll would claim.
+    Due {
+        #[arg(long, default_value_t = 25)]
+        limit: u32,
+    },
+
+    /// Re-queue a tenant's dead-lettered notifications as fresh copies.
+    Replay {
+        #[arg(long)]
+        tenant: Uuid,
+
+        #[arg(long, default_value_t = 25)]
+        limit: u32,
+    },
 }

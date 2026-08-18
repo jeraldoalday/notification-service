@@ -67,6 +67,12 @@ async fn run() -> CliResult<()> {
         Command::Queue(QueueCommand::Stats { tenant }) => {
             commands::queue::stats(&storage, tenant, cli.output).await?
         }
+        Command::Queue(QueueCommand::Due { limit }) => {
+            commands::queue::due(&storage, limit, cli.output).await?
+        }
+        Command::Queue(QueueCommand::Replay { tenant, limit }) => {
+            commands::queue::replay(&storage, tenant, limit, cli.output).await?
+        }
     };
 
     print!("{rendered}");
