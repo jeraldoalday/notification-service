@@ -12,6 +12,8 @@
 
 pub mod error;
 pub mod render;
+pub mod template;
 
 pub use error::{TemplateError, TemplateResult};
 pub use render::{missing_variables, placeholders, render, Segment};
+pub use template::{RenderedMessage, Template};
