@@ -1283,6 +1283,7 @@ dependencies = [
  "ns-core",
  "ns-queue",
  "ns-storage",
+ "ns-templates",
  "serde",
  "serde_json",
  "tempfile",

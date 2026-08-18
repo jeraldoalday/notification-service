@@ -6,6 +6,7 @@ use axum::Json;
 use ns_core::CoreError;
 use ns_queue::QueueError;
 use ns_storage::StorageError;
+use ns_templates::TemplateError;
 use serde::Serialize;
 use thiserror::Error;
 
@@ -24,6 +25,9 @@ pub enum ApiError {
 
     #[error(transparent)]
     Storage(#[from] StorageError),
+
+    #[error(transparent)]
+    Template(#[from] TemplateError),
 
     #[error("{0}")]
     NotFound(String),
@@ -72,8 +76,25 @@ fn status_for_core(err: &CoreError) -> StatusCode {
     }
 }
 
+/// Authoring mistakes are the caller's request being wrong (400); a
+/// missing variable or a channel-pinned template used on another channel
+/// is a well-formed request the service understood but can't act on (422),
+/// matching how a recipient missing an address for its channel is reported.
+fn status_for_template(err: &TemplateError) -> StatusCode {
+    match err {
+        TemplateError::Validation(_)
+        | TemplateError::UnclosedPlaceholder { .. }
+        | TemplateError::InvalidPlaceholderName(_) => StatusCode::BAD_REQUEST,
+        TemplateError::MissingVariable { .. } | TemplateError::ChannelMismatch { .. } => {
+            StatusCode::UNPROCESSABLE_ENTITY
+        }
+    }
+}
+
 fn status_for_storage(err: &StorageError) -> StatusCode {
     match err {
+        StorageError::TemplateNotFound { .. } => StatusCode::NOT_FOUND,
+        StorageError::TemplateAlreadyExists { .. } => StatusCode::CONFLICT,
         StorageError::NotificationNotFound(_) | StorageError::RecipientNotFound(_) => StatusCode::NOT_FOUND,
         StorageError::Database(_) | StorageError::Migration(_) | StorageError::Serialization(_) => {
             StatusCode::INTERNAL_SERVER_ERROR
@@ -88,6 +109,7 @@ impl IntoResponse for ApiError {
             ApiError::Queue(QueueError::Core(err)) => status_for_core(err),
             ApiError::Queue(QueueError::Storage(err)) => status_for_storage(err),
             ApiError::Storage(err) => status_for_storage(err),
+            ApiError::Template(err) => status_for_template(err),
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
         };

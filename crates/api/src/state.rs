@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use ns_queue::NotificationQueue;
-use ns_storage::{NotificationRepository, RecipientRepository};
+use ns_storage::{NotificationRepository, RecipientRepository, TemplateRepository};
 
 /// Shared state handed to every request handler: a `NotificationQueue` for
 /// the submit/claim/complete/fail lifecycle, plus direct access to the
@@ -25,7 +25,7 @@ where
 
 impl<R> AppState<R>
 where
-    R: NotificationRepository + RecipientRepository + Clone,
+    R: NotificationRepository + RecipientRepository + TemplateRepository + Clone,
 {
     pub fn new(repo: R) -> Self {
         Self { queue: Arc::new(NotificationQueue::new(repo.clone())), repo }
