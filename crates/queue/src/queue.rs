@@ -89,6 +89,34 @@ impl<R: NotificationRepository> NotificationQueue<R> {
         Ok(notification)
     }
 
+    /// Puts a claimed (`Sending`) notification back on the queue after
+    /// `retry_after`, *without* recording a delivery attempt.
+    ///
+    /// This is for the cases where the worker decided not to try at all --
+    /// the channel's rate limit is exhausted, or its circuit breaker is
+    /// open. Reporting those through `fail` would spend one of the
+    /// notification's `max_attempts` on an attempt that never happened, so
+    /// a long provider outage or a sustained burst would dead-letter
+    /// perfectly good work that no provider ever saw. Deferring instead
+    /// leaves the attempt budget for actual delivery attempts.
+    ///
+    /// The status still travels `Sending` -> `Failed` -> `Queued`, because
+    /// that's the only way out of `Sending` that `DeliveryStatus` allows;
+    /// what changes is that `attempt_count` is untouched.
+    pub async fn defer(
+        &self,
+        mut notification: Notification,
+        retry_after: chrono::Duration,
+        now: DateTime<Utc>,
+    ) -> QueueResult<Notification> {
+        notification.transition(DeliveryStatus::Failed, now)?;
+        notification.scheduled_for = Some(now + retry_after);
+        notification.transition(DeliveryStatus::Queued, now)?;
+
+        self.repo.update_notification(&notification).await?;
+        Ok(notification)
+    }
+
     /// Re-queues work that dead-lettered, as a *new* notification cloned
     /// from the old one.
     ///
@@ -337,5 +365,64 @@ mod tests {
         let replayed = queue.replay_dead_lettered(Uuid::new_v4(), 10, Utc::now()).await.unwrap();
 
         assert!(replayed.is_empty());
+    }
+
+    #[tokio::test]
+    async fn defer_requeues_without_spending_an_attempt() {
+        let (queue, _dir) = test_queue().await;
+        queue.submit(sample_notification(), Utc::now()).await.unwrap();
+        let claimed = queue.claim_batch(Utc::now(), 10).await.unwrap().remove(0);
+        let now = Utc::now();
+
+        let deferred = queue.defer(claimed, chrono::Duration::seconds(30), now).await.unwrap();
+
+        assert_eq!(deferred.status, DeliveryStatus::Queued);
+        assert_eq!(deferred.attempt_count, 0, "nothing was attempted, so nothing was spent");
+        assert_eq!(deferred.scheduled_for, Some(now + chrono::Duration::seconds(30)));
+    }
+
+    #[tokio::test]
+    async fn deferred_work_is_claimable_again_once_its_delay_passes() {
+        let (queue, _dir) = test_queue().await;
+        queue.submit(sample_notification(), Utc::now()).await.unwrap();
+        let claimed = queue.claim_batch(Utc::now(), 10).await.unwrap().remove(0);
+        let now = Utc::now();
+        let deferred = queue.defer(claimed, chrono::Duration::seconds(30), now).await.unwrap();
+
+        assert!(queue.claim_batch(now, 10).await.unwrap().is_empty(), "still behind its delay");
+
+        let later = queue.claim_batch(now + chrono::Duration::seconds(31), 10).await.unwrap();
+        assert_eq!(later.len(), 1);
+        assert_eq!(later[0].id, deferred.id);
+    }
+
+    #[tokio::test]
+    async fn deferring_repeatedly_never_dead_letters() {
+        let (queue, _dir) = test_queue().await;
+        // max_attempts is 2 for sample notifications; deferring far more
+        // times than that must not exhaust them.
+        queue.submit(sample_notification(), Utc::now()).await.unwrap();
+        let mut now = Utc::now();
+
+        for _ in 0..5 {
+            let claimed = queue.claim_batch(now, 10).await.unwrap().remove(0);
+            let deferred = queue.defer(claimed, chrono::Duration::seconds(1), now).await.unwrap();
+            assert_eq!(deferred.status, DeliveryStatus::Queued);
+            now += chrono::Duration::seconds(2);
+        }
+
+        let claimed = queue.claim_batch(now, 10).await.unwrap();
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].attempt_count, 0);
+    }
+
+    #[tokio::test]
+    async fn deferring_work_that_was_not_claimed_is_rejected() {
+        let (queue, _dir) = test_queue().await;
+        let queued = queue.submit(sample_notification(), Utc::now()).await.unwrap();
+
+        let err = queue.defer(queued, chrono::Duration::seconds(1), Utc::now()).await.unwrap_err();
+
+        assert!(matches!(err, QueueError::Core(_)), "only Sending work can be deferred");
     }
 }
