@@ -1,0 +1,29 @@
+[package]
+name = "ns-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Admin CLI for the notification service: submit test notifications, inspect the queue, manage templates"
+
+[[bin]]
+name = "ns"
+path = "src/main.rs"
+
+[dependencies]
+ns-core = { path = "../core" }
+ns-config = { path = "../config" }
+ns-storage = { path = "../storage" }
+ns-queue = { path = "../queue" }
+ns-templates = { path = "../templates" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+tokio.workspace = true
+clap = { version = "4", features = ["derive", "env"] }
+
+[dev-dependencies]
+tempfile = "3"
+ns-queue = { path = "../queue" }
