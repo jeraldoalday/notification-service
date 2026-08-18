@@ -111,6 +111,10 @@ impl IntoResponse for ApiError {
             ApiError::Core(err) => status_for_core(err),
             ApiError::Queue(QueueError::Core(err)) => status_for_core(err),
             ApiError::Queue(QueueError::Storage(err)) => status_for_storage(err),
+            // Asking to replay something that isn't dead-lettered is a
+            // conflict with the notification's current state, the same way
+            // cancelling an already-sending notification is.
+            ApiError::Queue(QueueError::NotReplayable { .. }) => StatusCode::CONFLICT,
             ApiError::Storage(err) => status_for_storage(err),
             ApiError::Template(err) => status_for_template(err),
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,

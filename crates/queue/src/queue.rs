@@ -1,9 +1,10 @@
 use chrono::{DateTime, Utc};
 use ns_core::{DeliveryStatus, Notification};
 use ns_storage::NotificationRepository;
+use uuid::Uuid;
 
 use crate::backoff;
-use crate::error::QueueResult;
+use crate::error::{QueueError, QueueResult};
 
 /// Durable job queue built on top of a `NotificationRepository`: submitting
 /// new work, claiming due work for processing without double-dispatching
@@ -86,6 +87,55 @@ impl<R: NotificationRepository> NotificationQueue<R> {
 
         self.repo.update_notification(&notification).await?;
         Ok(notification)
+    }
+
+    /// Re-queues work that dead-lettered, as a *new* notification cloned
+    /// from the old one.
+    ///
+    /// It has to be a new notification rather than a revival of the old
+    /// row: `DeliveryStatus` is one-directional and `DeadLettered` is
+    /// terminal, so there is no legal path back to `Queued`. Cloning keeps
+    /// that guarantee intact and leaves the original row as the record of
+    /// what happened -- which attempts were made, when it gave up -- while
+    /// the replay starts with a clean attempt count and no leftover
+    /// backoff schedule.
+    ///
+    /// Only dead-lettered notifications can be replayed: replaying
+    /// something that was cancelled would undo a deliberate decision, and
+    /// replaying live work would double-send it.
+    pub async fn replay(&self, notification: &Notification, now: DateTime<Utc>) -> QueueResult<Notification> {
+        if notification.status != DeliveryStatus::DeadLettered {
+            return Err(QueueError::NotReplayable { id: notification.id, status: notification.status });
+        }
+
+        let mut replayed = notification.clone();
+        replayed.id = Uuid::new_v4();
+        replayed.status = DeliveryStatus::default();
+        replayed.attempt_count = 0;
+        replayed.scheduled_for = None;
+        replayed.created_at = now;
+        replayed.updated_at = now;
+
+        self.submit(replayed, now).await
+    }
+
+    /// Replays up to `limit` of a tenant's dead-lettered notifications,
+    /// oldest work last (the repository lists newest-first). Returns the
+    /// newly queued copies.
+    pub async fn replay_dead_lettered(
+        &self,
+        tenant_id: Uuid,
+        limit: u32,
+        now: DateTime<Utc>,
+    ) -> QueueResult<Vec<Notification>> {
+        let dead_lettered =
+            self.repo.list_by_tenant(tenant_id, Some(DeliveryStatus::DeadLettered), limit).await?;
+
+        let mut replayed = Vec::with_capacity(dead_lettered.len());
+        for notification in &dead_lettered {
+            replayed.push(self.replay(notification, now).await?);
+        }
+        Ok(replayed)
     }
 }
 
@@ -183,5 +233,109 @@ mod tests {
 
         assert_eq!(dead_lettered.status, DeliveryStatus::DeadLettered);
         assert_eq!(dead_lettered.attempt_count, 2);
+    }
+
+    /// Drives a notification all the way to `DeadLettered` through the
+    /// ordinary failure path, so replay is tested against a row the queue
+    /// itself produced rather than a hand-built one.
+    async fn dead_letter(queue: &NotificationQueue<SqliteStorage>) -> Notification {
+        let submitted = queue.submit(sample_notification(), Utc::now()).await.unwrap();
+        let mut current = submitted;
+        loop {
+            let claimed = queue.claim_batch(Utc::now(), 10).await.unwrap();
+            let claimed = claimed.into_iter().find(|n| n.id == current.id).expect("claimable");
+            current = queue.fail(claimed, Utc::now()).await.unwrap();
+            if current.status == DeliveryStatus::DeadLettered {
+                return current;
+            }
+            // The retry was scheduled behind a backoff delay; clear it so
+            // the next claim_batch picks it straight back up.
+            current.scheduled_for = None;
+            queue.repo.update_notification(&current).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn replay_queues_a_fresh_copy_of_dead_lettered_work() {
+        let (queue, _dir) = test_queue().await;
+        let dead = dead_letter(&queue).await;
+
+        let replayed = queue.replay(&dead, Utc::now()).await.unwrap();
+
+        assert_ne!(replayed.id, dead.id, "replay creates a successor, not a revival");
+        assert_eq!(replayed.status, DeliveryStatus::Queued);
+        assert_eq!(replayed.attempt_count, 0);
+        assert_eq!(replayed.scheduled_for, None);
+        assert_eq!(replayed.body, dead.body);
+        assert_eq!(replayed.tenant_id, dead.tenant_id);
+        assert_eq!(replayed.recipient_id, dead.recipient_id);
+    }
+
+    #[tokio::test]
+    async fn replay_leaves_the_original_dead_lettered() {
+        let (queue, _dir) = test_queue().await;
+        let dead = dead_letter(&queue).await;
+
+        queue.replay(&dead, Utc::now()).await.unwrap();
+
+        let stored = queue.repo.get_notification(dead.id).await.unwrap();
+        assert_eq!(stored.status, DeliveryStatus::DeadLettered, "the record of what happened survives");
+        assert_eq!(stored.attempt_count, dead.attempt_count);
+    }
+
+    #[tokio::test]
+    async fn replayed_work_is_claimable_again() {
+        let (queue, _dir) = test_queue().await;
+        let dead = dead_letter(&queue).await;
+
+        let replayed = queue.replay(&dead, Utc::now()).await.unwrap();
+        let claimed = queue.claim_batch(Utc::now(), 10).await.unwrap();
+
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].id, replayed.id);
+    }
+
+    #[tokio::test]
+    async fn replaying_live_work_is_rejected() {
+        let (queue, _dir) = test_queue().await;
+        let queued = queue.submit(sample_notification(), Utc::now()).await.unwrap();
+
+        let err = queue.replay(&queued, Utc::now()).await.unwrap_err();
+
+        assert!(matches!(err, QueueError::NotReplayable { .. }));
+    }
+
+    #[tokio::test]
+    async fn replaying_a_cancelled_notification_is_rejected() {
+        let (queue, _dir) = test_queue().await;
+        let mut notification = sample_notification();
+        notification.transition(DeliveryStatus::Cancelled, Utc::now()).unwrap();
+
+        let err = queue.replay(&notification, Utc::now()).await.unwrap_err();
+
+        assert!(matches!(err, QueueError::NotReplayable { .. }), "cancelling was a deliberate decision");
+    }
+
+    #[tokio::test]
+    async fn replay_dead_lettered_is_tenant_scoped_and_limited() {
+        let (queue, _dir) = test_queue().await;
+        let first = dead_letter(&queue).await;
+        let second = dead_letter(&queue).await;
+        assert_ne!(first.tenant_id, second.tenant_id, "sample notifications get distinct tenants");
+
+        let replayed = queue.replay_dead_lettered(first.tenant_id, 10, Utc::now()).await.unwrap();
+
+        assert_eq!(replayed.len(), 1);
+        assert_eq!(replayed[0].tenant_id, first.tenant_id);
+    }
+
+    #[tokio::test]
+    async fn replay_dead_lettered_finds_nothing_when_the_tenant_is_clean() {
+        let (queue, _dir) = test_queue().await;
+        queue.submit(sample_notification(), Utc::now()).await.unwrap();
+
+        let replayed = queue.replay_dead_lettered(Uuid::new_v4(), 10, Utc::now()).await.unwrap();
+
+        assert!(replayed.is_empty());
     }
 }

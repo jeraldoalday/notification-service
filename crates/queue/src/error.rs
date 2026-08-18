@@ -4,6 +4,9 @@ pub type QueueResult<T> = Result<T, QueueError>;
 
 #[derive(Debug, Error)]
 pub enum QueueError {
+    #[error("notification {id} is {status} and cannot be replayed; only dead-lettered work can be")]
+    NotReplayable { id: uuid::Uuid, status: ns_core::DeliveryStatus },
+
     #[error(transparent)]
     Storage(#[from] ns_storage::StorageError),
 

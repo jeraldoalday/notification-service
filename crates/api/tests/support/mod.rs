@@ -1,3 +1,9 @@
+// Each integration test binary compiles this module separately, so a
+// helper used by only some of them looks dead to the others. CI builds
+// with -D warnings, so opt out here rather than letting the shared
+// helpers fragment per test file.
+#![allow(dead_code)]
+
 use axum::body::Body;
 use axum::http::{Request, Response};
 use ns_api::{build_router, AppState};
