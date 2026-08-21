@@ -24,7 +24,8 @@ pub fn load_from_file(path: impl AsRef<Path>) -> Result<Settings, ConfigError> {
 /// Recognized keys: `NS_SERVER_HOST`, `NS_SERVER_PORT`, `NS_DATABASE_URL`,
 /// `NS_DATABASE_MAX_CONNECTIONS`, `NS_QUEUE_POLL_INTERVAL_MS`,
 /// `NS_QUEUE_BATCH_SIZE`, `NS_QUEUE_MAX_RETRY_ATTEMPTS`, `NS_SMTP_HOST`,
-/// `NS_SMTP_PORT`, `NS_SMTP_USERNAME`, `NS_SMTP_FROM_ADDRESS`.
+/// `NS_SMTP_PORT`, `NS_SMTP_USERNAME`, `NS_SMTP_FROM_ADDRESS`,
+/// `NS_AUTH_ENABLED`.
 /// Unrecognized keys are ignored so callers can pass through the full
 /// process environment safely.
 pub fn apply_overrides(
@@ -65,6 +66,12 @@ pub fn apply_overrides(
     if let Some(from) = overrides.get("NS_SMTP_FROM_ADDRESS") {
         settings.smtp.from_address = from.clone();
     }
+
+    // Parsed rather than treated as "set means true", so that
+    // NS_AUTH_ENABLED=false turns authentication off and
+    // NS_AUTH_ENABLED=maybe is a startup error instead of quietly
+    // meaning whichever one the reader didn't expect.
+    parse_override!("NS_AUTH_ENABLED", settings.auth.enabled);
 
     Ok(settings)
 }
@@ -123,6 +130,26 @@ mod tests {
         let settings = apply_overrides(Settings::default(), &overrides).unwrap();
         assert_eq!(settings.queue.max_retry_attempts, 8);
         assert_eq!(settings.smtp.from_address, "alerts@example.com");
+    }
+
+    #[test]
+    fn auth_is_required_unless_explicitly_disabled() {
+        assert!(Settings::default().auth.enabled, "the safe default is the one a deployment gets for free");
+
+        let mut overrides = HashMap::new();
+        overrides.insert("NS_AUTH_ENABLED".to_string(), "false".to_string());
+        assert!(!apply_overrides(Settings::default(), &overrides).unwrap().auth.enabled);
+
+        overrides.insert("NS_AUTH_ENABLED".to_string(), "true".to_string());
+        assert!(apply_overrides(Settings::default(), &overrides).unwrap().auth.enabled);
+    }
+
+    #[test]
+    fn an_unparseable_auth_flag_is_an_error_not_a_guess() {
+        let mut overrides = HashMap::new();
+        overrides.insert("NS_AUTH_ENABLED".to_string(), "maybe".to_string());
+        let err = apply_overrides(Settings::default(), &overrides).unwrap_err();
+        assert!(matches!(err, ConfigError::InvalidOverride { .. }));
     }
 
     #[test]

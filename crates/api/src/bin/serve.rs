@@ -14,7 +14,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let settings = ns_config::load(&config_path)?;
 
     let storage = SqliteStorage::connect(&settings.database.url).await?;
-    let router = build_router(AppState::new(storage));
+
+    let state = if settings.auth.enabled {
+        AppState::new(storage)
+    } else {
+        // Loud on purpose. An API that sends messages on anyone's behalf
+        // with no credential is a thing an operator should have chosen,
+        // not something they discover from a bill.
+        tracing::warn!(
+            "authentication is DISABLED: every request can act as any tenant. \
+             Set auth.enabled = true (or NS_AUTH_ENABLED=true) unless the network \
+             already controls who can reach this service."
+        );
+        AppState::new(storage).without_auth()
+    };
+    let router = build_router(state);
 
     let addr: SocketAddr = format!("{}:{}", settings.server.host, settings.server.port).parse()?;
     let listener = tokio::net::TcpListener::bind(addr).await?;

@@ -1387,6 +1387,7 @@ dependencies = [
  "axum",
  "chrono",
  "http-body-util",
+ "ns-auth",
  "ns-config",
  "ns-core",
  "ns-metrics",

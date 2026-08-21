@@ -21,3 +21,9 @@ host = "localhost"
 port = 587
 username = ""
 from_address = "notifications@example.com"
+
+[auth]
+# Require an API key on every data endpoint. Turning this off means any
+# request that reaches the service can send notifications as any tenant,
+# so only do it where the network already decides who can reach it.
+enabled = true

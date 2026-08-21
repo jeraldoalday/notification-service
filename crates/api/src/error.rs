@@ -1,8 +1,9 @@
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{FromRequest, Request};
-use axum::http::StatusCode;
+use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
+use ns_auth::AuthError;
 use ns_core::CoreError;
 use ns_queue::QueueError;
 use ns_storage::StorageError;
@@ -34,6 +35,16 @@ pub enum ApiError {
 
     #[error("{0}")]
     BadRequest(String),
+
+    #[error(transparent)]
+    Auth(#[from] AuthError),
+
+    /// A fault on this side of the wire, reported without detail. Used
+    /// where an invariant the wiring is supposed to guarantee turns out
+    /// not to hold -- a route mounted without its authentication layer,
+    /// say -- which the caller can do nothing about.
+    #[error("internal error")]
+    Internal(String),
 }
 
 #[derive(Serialize)]
@@ -111,6 +122,18 @@ fn status_for_storage(err: &StorageError) -> StatusCode {
     }
 }
 
+/// 401 for "you presented no usable credential", 403 for "your credential
+/// isn't allowed to do that". The split matters to a client: a 401 says
+/// try again with a credential, a 403 says a different credential of the
+/// same kind won't help.
+fn status_for_auth(err: &AuthError) -> StatusCode {
+    if err.is_unauthenticated() {
+        StatusCode::UNAUTHORIZED
+    } else {
+        StatusCode::FORBIDDEN
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let status = match &self {
@@ -125,8 +148,23 @@ impl IntoResponse for ApiError {
             ApiError::Template(err) => status_for_template(err),
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            ApiError::Auth(err) => status_for_auth(err),
+            ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
 
-        (status, Json(ErrorBody { error: self.to_string() })).into_response()
+        // Details of an internal fault go to the operator's log and no
+        // further; the caller gets the bare status.
+        if let ApiError::Internal(detail) = &self {
+            tracing::error!(detail = %detail, "internal error serving request");
+        }
+
+        let body = Json(ErrorBody { error: self.to_string() });
+
+        // RFC 9110 requires a challenge on a 401, and it's what tells a
+        // client library which scheme to retry under.
+        if status == StatusCode::UNAUTHORIZED {
+            return (status, [(header::WWW_AUTHENTICATE, "Bearer")], body).into_response();
+        }
+        (status, body).into_response()
     }
 }

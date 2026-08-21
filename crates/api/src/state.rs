@@ -2,7 +2,9 @@ use std::sync::Arc;
 
 use ns_metrics::ServiceMetrics;
 use ns_queue::NotificationQueue;
-use ns_storage::{NotificationRepository, RecipientRepository, TemplateRepository};
+use ns_storage::{ApiKeyRepository, NotificationRepository, RecipientRepository, TemplateRepository};
+
+use crate::auth::AuthMode;
 
 /// Shared state handed to every request handler: a `NotificationQueue` for
 /// the submit/claim/complete/fail lifecycle, plus direct access to the
@@ -17,6 +19,11 @@ pub struct AppState<R> {
     /// worker together exports one set of counters covering both, instead
     /// of two disjoint halves of the same story.
     pub metrics: Arc<ServiceMetrics>,
+    /// Whether credentials are checked. Held on the state rather than
+    /// baked into the router so that the same `build_router` serves both
+    /// modes and the choice stays visible at the one call site that makes
+    /// it.
+    pub auth: AuthMode,
 }
 
 impl<R> Clone for AppState<R>
@@ -24,14 +31,21 @@ where
     R: Clone,
 {
     fn clone(&self) -> Self {
-        Self { queue: Arc::clone(&self.queue), repo: self.repo.clone(), metrics: Arc::clone(&self.metrics) }
+        Self {
+            queue: Arc::clone(&self.queue),
+            repo: self.repo.clone(),
+            metrics: Arc::clone(&self.metrics),
+            auth: self.auth,
+        }
     }
 }
 
 impl<R> AppState<R>
 where
-    R: NotificationRepository + RecipientRepository + TemplateRepository + Clone,
+    R: NotificationRepository + RecipientRepository + TemplateRepository + ApiKeyRepository + Clone,
 {
+    /// State with authentication required, which is what a deployment
+    /// should want; `without_auth` is the deliberate opt-out.
     pub fn new(repo: R) -> Self {
         Self::with_metrics(repo, Arc::new(ServiceMetrics::new()))
     }
@@ -40,6 +54,19 @@ where
     /// process that also runs a `ns_worker::Worker` and wants both halves
     /// reporting into the same registry.
     pub fn with_metrics(repo: R, metrics: Arc<ServiceMetrics>) -> Self {
-        Self { queue: Arc::new(NotificationQueue::new(repo.clone())), repo, metrics }
+        Self {
+            queue: Arc::new(NotificationQueue::new(repo.clone())),
+            repo,
+            metrics,
+            auth: AuthMode::Required,
+        }
+    }
+
+    /// Turns credential checking off. Only safe where the network already
+    /// decides who can reach the service, and named so that a reader of
+    /// the call site can see that's what was chosen.
+    pub fn without_auth(mut self) -> Self {
+        self.auth = AuthMode::Disabled;
+        self
     }
 }

@@ -13,6 +13,7 @@ ns-queue = { path = "../queue" }
 ns-templates = { path = "../templates" }
 ns-config = { path = "../config" }
 ns-metrics = { path = "../metrics" }
+ns-auth = { path = "../auth" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
@@ -27,5 +28,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
+ns-auth = { path = "../auth" }
 tempfile = "3"
 http-body-util = "0.1"

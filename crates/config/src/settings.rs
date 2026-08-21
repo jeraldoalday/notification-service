@@ -7,6 +7,7 @@ pub struct Settings {
     pub database: DatabaseSettings,
     pub queue: QueueSettings,
     pub smtp: SmtpSettings,
+    pub auth: AuthSettings,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -46,6 +47,24 @@ pub struct QueueSettings {
 impl Default for QueueSettings {
     fn default() -> Self {
         Self { poll_interval_ms: 500, batch_size: 25, max_retry_attempts: 5 }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AuthSettings {
+    /// Whether the HTTP API requires an API key.
+    ///
+    /// Defaults to `true`. A deployment that wants the API open has to say
+    /// so, because the failure mode of the other default -- shipping with
+    /// authentication off and nobody noticing -- is an unauthenticated
+    /// notification sender on the public internet.
+    pub enabled: bool,
+}
+
+impl Default for AuthSettings {
+    fn default() -> Self {
+        Self { enabled: true }
     }
 }
 
