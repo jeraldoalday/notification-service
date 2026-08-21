@@ -95,7 +95,13 @@ fn status_for_storage(err: &StorageError) -> StatusCode {
     match err {
         StorageError::TemplateNotFound { .. } => StatusCode::NOT_FOUND,
         StorageError::TemplateAlreadyExists { .. } => StatusCode::CONFLICT,
-        StorageError::NotificationNotFound(_) | StorageError::RecipientNotFound(_) => StatusCode::NOT_FOUND,
+        StorageError::NotificationNotFound(_)
+        | StorageError::RecipientNotFound(_)
+        | StorageError::ApiKeyNotFound(_) => StatusCode::NOT_FOUND,
+        // A token that resolves to no key is a credential problem, not a
+        // missing resource: the caller asked about itself, and the answer
+        // is that it isn't anyone.
+        StorageError::UnknownApiKey => StatusCode::UNAUTHORIZED,
         // UnknownStatus means a row this service wrote can no longer be
         // read back, which is a server-side problem, not a bad request.
         StorageError::Database(_)

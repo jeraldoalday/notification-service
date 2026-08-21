@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use ns_auth::ApiKey;
 use ns_core::{DeliveryStatus, Notification, Recipient};
 use ns_templates::Template;
 use uuid::Uuid;
@@ -100,4 +101,36 @@ pub trait TemplateRepository: Send + Sync {
     async fn list_templates(&self, tenant_id: Uuid, limit: u32) -> StorageResult<Vec<Template>>;
 
     async fn delete_template(&self, tenant_id: Uuid, id: &str) -> StorageResult<()>;
+}
+
+/// Persistence for `ApiKey`s.
+///
+/// The lookup authentication actually uses is `find_api_key_by_digest`,
+/// keyed on the digest rather than on the key's id: a caller presents only
+/// a token, so the digest is the only thing the service can compute before
+/// it knows which key -- or which tenant -- it is dealing with.
+#[async_trait]
+pub trait ApiKeyRepository: Send + Sync {
+    async fn insert_api_key(&self, key: &ApiKey) -> StorageResult<()>;
+
+    async fn get_api_key(&self, id: Uuid) -> StorageResult<ApiKey>;
+
+    /// Resolves a presented token's digest to the key that issued it,
+    /// returning `StorageError::UnknownApiKey` if nothing matches.
+    ///
+    /// Revoked keys are returned rather than filtered out here. Whether a
+    /// revoked credential is acceptable is `ns-auth`'s decision, and
+    /// hiding those rows would leave the caller unable to tell "this token
+    /// was never real" from "this token was turned off" -- a distinction
+    /// the operator's logs need even though the response to the caller is
+    /// the same either way.
+    async fn find_api_key_by_digest(&self, digest: &str) -> StorageResult<ApiKey>;
+
+    /// A tenant's keys, newest-first, capped at `limit`. Includes revoked
+    /// keys, since an operator auditing who had access needs to see the
+    /// ones that were turned off as much as the ones still live.
+    async fn list_api_keys(&self, tenant_id: Uuid, limit: u32) -> StorageResult<Vec<ApiKey>>;
+
+    /// Persists the current state of `key` -- in practice, its revocation.
+    async fn update_api_key(&self, key: &ApiKey) -> StorageResult<()>;
 }

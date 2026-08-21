@@ -3,6 +3,7 @@ use std::str::FromStr;
 
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
+use ns_auth::ApiKey;
 use ns_core::{DeliveryStatus, Notification, Recipient};
 use ns_templates::Template;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
@@ -10,7 +11,7 @@ use sqlx::Row;
 use uuid::Uuid;
 
 use crate::error::{StorageError, StorageResult};
-use crate::repository::{NotificationRepository, RecipientRepository, TemplateRepository};
+use crate::repository::{ApiKeyRepository, NotificationRepository, RecipientRepository, TemplateRepository};
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 
@@ -371,10 +372,91 @@ impl TemplateRepository for SqliteStorage {
     }
 }
 
+#[async_trait]
+impl ApiKeyRepository for SqliteStorage {
+    async fn insert_api_key(&self, key: &ApiKey) -> StorageResult<()> {
+        let data = serde_json::to_string(key)?;
+        sqlx::query(
+            "INSERT INTO api_keys (id, tenant_id, token_digest, created_at, revoked_at, data)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(key.id.to_string())
+        .bind(key.tenant_id.to_string())
+        .bind(&key.token_digest)
+        .bind(to_ts(key.created_at))
+        .bind(key.revoked_at.map(to_ts))
+        .bind(data)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn get_api_key(&self, id: Uuid) -> StorageResult<ApiKey> {
+        let row = sqlx::query("SELECT data FROM api_keys WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(StorageError::ApiKeyNotFound(id))?;
+        let data: String = row.try_get("data")?;
+        Ok(serde_json::from_str(&data)?)
+    }
+
+    async fn find_api_key_by_digest(&self, digest: &str) -> StorageResult<ApiKey> {
+        // A point query on the UNIQUE token_digest index. This runs on
+        // every authenticated request, so it has to stay one indexed
+        // lookup rather than anything that grows with the number of keys
+        // issued.
+        let row = sqlx::query("SELECT data FROM api_keys WHERE token_digest = ?")
+            .bind(digest)
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or(StorageError::UnknownApiKey)?;
+        let data: String = row.try_get("data")?;
+        Ok(serde_json::from_str(&data)?)
+    }
+
+    async fn list_api_keys(&self, tenant_id: Uuid, limit: u32) -> StorageResult<Vec<ApiKey>> {
+        let rows = sqlx::query(
+            "SELECT data FROM api_keys WHERE tenant_id = ? ORDER BY created_at DESC, id ASC LIMIT ?",
+        )
+        .bind(tenant_id.to_string())
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let data: String = row.try_get("data")?;
+                Ok(serde_json::from_str(&data)?)
+            })
+            .collect()
+    }
+
+    async fn update_api_key(&self, key: &ApiKey) -> StorageResult<()> {
+        let data = serde_json::to_string(key)?;
+        // token_digest is deliberately absent from the SET list: a key's
+        // token is fixed for its lifetime, and rotating one means issuing
+        // a new key and revoking this one, so that the old token stops
+        // working at a moment the audit trail records.
+        let result = sqlx::query("UPDATE api_keys SET revoked_at = ?, data = ? WHERE id = ?")
+            .bind(key.revoked_at.map(to_ts))
+            .bind(data)
+            .bind(key.id.to_string())
+            .execute(&self.pool)
+            .await?;
+
+        if result.rows_affected() == 0 {
+            return Err(StorageError::ApiKeyNotFound(key.id));
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::Duration;
+    use ns_auth::ApiKey;
     use ns_core::{ChannelKind, DeliveryStatus, Priority, Recipient, RecipientAddress};
 
     /// Each test gets its own on-disk SQLite file rather than
@@ -848,5 +930,125 @@ mod tests {
     fn status_from_str_rejects_an_unknown_value() {
         let err = status_from_str("exploded").unwrap_err();
         assert!(matches!(err, StorageError::UnknownStatus(_)));
+    }
+
+    fn sample_api_key(tenant_id: Uuid) -> (ApiKey, ns_auth::SecretToken) {
+        ApiKey::generate(tenant_id, "ci-deploy", [ns_auth::Scope::Write], Utc::now())
+    }
+
+    #[tokio::test]
+    async fn api_keys_round_trip_by_id_and_by_digest() {
+        let (storage, _dir) = test_storage().await;
+        let (key, token) = sample_api_key(Uuid::new_v4());
+        storage.insert_api_key(&key).await.unwrap();
+
+        assert_eq!(storage.get_api_key(key.id).await.unwrap(), key);
+        assert_eq!(storage.find_api_key_by_digest(&token.digest()).await.unwrap(), key);
+    }
+
+    #[tokio::test]
+    async fn an_unknown_digest_is_its_own_error() {
+        let (storage, _dir) = test_storage().await;
+        let err = storage.find_api_key_by_digest("not-a-digest").await.unwrap_err();
+        assert!(matches!(err, StorageError::UnknownApiKey));
+        assert!(!err.to_string().contains("not-a-digest"), "the presented digest must not reach the message");
+    }
+
+    #[tokio::test]
+    async fn the_clear_token_is_never_written_to_the_row() {
+        let (storage, _dir) = test_storage().await;
+        let (key, token) = sample_api_key(Uuid::new_v4());
+        storage.insert_api_key(&key).await.unwrap();
+
+        let row = sqlx::query("SELECT data, token_digest FROM api_keys WHERE id = ?")
+            .bind(key.id.to_string())
+            .fetch_one(&storage.pool)
+            .await
+            .unwrap();
+        let data: String = row.try_get("data").unwrap();
+        let digest: String = row.try_get("token_digest").unwrap();
+        assert!(!data.contains(token.expose()), "{data}");
+        assert!(!digest.contains(token.expose()));
+    }
+
+    #[tokio::test]
+    async fn revocation_is_persisted() {
+        let (storage, _dir) = test_storage().await;
+        let (mut key, _) = sample_api_key(Uuid::new_v4());
+        storage.insert_api_key(&key).await.unwrap();
+
+        key.revoke(Utc::now());
+        storage.update_api_key(&key).await.unwrap();
+
+        assert!(storage.get_api_key(key.id).await.unwrap().is_revoked());
+    }
+
+    #[tokio::test]
+    async fn a_revoked_key_is_still_resolvable_by_digest() {
+        let (storage, _dir) = test_storage().await;
+        let (mut key, token) = sample_api_key(Uuid::new_v4());
+        storage.insert_api_key(&key).await.unwrap();
+        key.revoke(Utc::now());
+        storage.update_api_key(&key).await.unwrap();
+
+        let found = storage.find_api_key_by_digest(&token.digest()).await.unwrap();
+        assert!(
+            found.is_revoked(),
+            "storage returns the row and lets ns-auth decide, so 'never real' stays distinguishable \
+             from 'turned off' in the operator's logs"
+        );
+    }
+
+    #[tokio::test]
+    async fn updating_a_missing_key_reports_not_found() {
+        let (storage, _dir) = test_storage().await;
+        let (key, _) = sample_api_key(Uuid::new_v4());
+        let err = storage.update_api_key(&key).await.unwrap_err();
+        assert!(matches!(err, StorageError::ApiKeyNotFound(id) if id == key.id));
+    }
+
+    #[tokio::test]
+    async fn listing_is_scoped_to_one_tenant_and_newest_first() {
+        let (storage, _dir) = test_storage().await;
+        let tenant = Uuid::new_v4();
+        let other_tenant = Uuid::new_v4();
+
+        let (mut older, _) = sample_api_key(tenant);
+        older.created_at = Utc::now() - Duration::hours(1);
+        older.name = "older".into();
+        let (mut newer, _) = sample_api_key(tenant);
+        newer.name = "newer".into();
+        let (theirs, _) = sample_api_key(other_tenant);
+
+        storage.insert_api_key(&older).await.unwrap();
+        storage.insert_api_key(&newer).await.unwrap();
+        storage.insert_api_key(&theirs).await.unwrap();
+
+        let listed = storage.list_api_keys(tenant, 10).await.unwrap();
+        let names: Vec<_> = listed.iter().map(|key| key.name.as_str()).collect();
+        assert_eq!(names, vec!["newer", "older"]);
+    }
+
+    #[tokio::test]
+    async fn listing_respects_its_limit() {
+        let (storage, _dir) = test_storage().await;
+        let tenant = Uuid::new_v4();
+        for _ in 0..5 {
+            let (key, _) = sample_api_key(tenant);
+            storage.insert_api_key(&key).await.unwrap();
+        }
+        assert_eq!(storage.list_api_keys(tenant, 2).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_digest_is_rejected_by_the_unique_index() {
+        let (storage, _dir) = test_storage().await;
+        let (first, _) = sample_api_key(Uuid::new_v4());
+        let mut clash = first.clone();
+        clash.id = Uuid::new_v4();
+
+        storage.insert_api_key(&first).await.unwrap();
+        let err = storage.insert_api_key(&clash).await.unwrap_err();
+        assert!(matches!(err, StorageError::Database(_)), "{err:?}");
     }
 }
