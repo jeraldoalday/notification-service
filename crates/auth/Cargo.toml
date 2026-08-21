@@ -1,0 +1,18 @@
+[package]
+name = "ns-auth"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "API keys, scopes and tenant identity for the notification service"
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+base64 = "0.22"
+rand = "0.8"
+sha2 = "0.10"
+subtle = "2"

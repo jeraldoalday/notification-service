@@ -1406,6 +1406,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "ns-auth"
+version = "0.1.0"
+dependencies = [
+ "base64 0.22.1",
+ "chrono",
+ "rand 0.8.7",
+ "serde",
+ "serde_json",
+ "sha2",
+ "subtle",
+ "thiserror 1.0.69",
+ "uuid",
+]
+
+[[package]]
 name = "ns-channels"
 version = "0.1.0"
 dependencies = [
