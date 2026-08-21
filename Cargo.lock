@@ -1465,6 +1465,9 @@ dependencies = [
 [[package]]
 name = "ns-metrics"
 version = "0.1.0"
+dependencies = [
+ "ns-core",
+]
 
 [[package]]
 name = "ns-queue"

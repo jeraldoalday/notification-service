@@ -7,3 +7,4 @@ repository.workspace = true
 description = "In-process metric instruments and a Prometheus text exposition renderer"
 
 [dependencies]
+ns-core = { path = "../core" }
