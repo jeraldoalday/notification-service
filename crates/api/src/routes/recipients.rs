@@ -8,11 +8,13 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::auth::Caller;
-use crate::error::{ApiJson, ApiResult};
+use crate::error::{ApiError, ApiJson, ApiResult};
 use crate::state::AppState;
 
 #[derive(Debug, Deserialize)]
 pub struct CreateRecipientRequest {
+    /// Optional when authenticated: the key names the tenant.
+    pub tenant_id: Option<Uuid>,
     pub display_name: Option<String>,
     #[serde(default)]
     pub addresses: Vec<RecipientAddress>,
@@ -21,6 +23,7 @@ pub struct CreateRecipientRequest {
 #[derive(Debug, Serialize)]
 pub struct RecipientResponse {
     pub id: Uuid,
+    pub tenant_id: Uuid,
     pub display_name: Option<String>,
     pub supported_channels: Vec<ns_core::ChannelKind>,
 }
@@ -29,9 +32,20 @@ impl From<Recipient> for RecipientResponse {
     fn from(recipient: Recipient) -> Self {
         Self {
             id: recipient.id,
+            tenant_id: recipient.tenant_id,
             display_name: recipient.display_name.clone(),
             supported_channels: recipient.supported_channels(),
         }
+    }
+}
+
+/// A recipient is reachable by its own tenant only. With authentication
+/// off there is no tenant to compare against, so every recipient is
+/// reachable -- which is the same trade that mode makes everywhere else.
+fn allowed(caller: &Caller, recipient: &Recipient) -> bool {
+    match caller.tenant_id() {
+        Some(tenant_id) => recipient.belongs_to(tenant_id),
+        None => true,
     }
 }
 
@@ -44,8 +58,9 @@ where
     R: NotificationRepository + RecipientRepository + TemplateRepository + ApiKeyRepository + Clone,
 {
     caller.require(Scope::Write)?;
+    let tenant_id = caller.tenant_for(request.tenant_id)?;
 
-    let mut recipient = Recipient::new(Uuid::new_v4());
+    let mut recipient = Recipient::new(Uuid::new_v4(), tenant_id);
     if let Some(name) = request.display_name {
         recipient = recipient.with_display_name(name);
     }
@@ -67,5 +82,11 @@ where
 {
     caller.require(Scope::Read)?;
     let recipient = state.repo.get_recipient(id).await?;
+    // 404 rather than 403, for the same reason a notification belonging to
+    // another tenant is: the id is opaque, so "not yours" and "not real"
+    // should be indistinguishable from outside.
+    if !allowed(&caller, &recipient) {
+        return Err(ApiError::NotFound(format!("recipient {id} not found")));
+    }
     Ok(Json(recipient.into()))
 }

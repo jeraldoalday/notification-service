@@ -39,8 +39,22 @@ async fn run() -> CliResult<()> {
         Command::Notification(NotificationCommand::Replay { id }) => {
             commands::notification::replay(&storage, id, cli.output).await?
         }
-        Command::Recipient(RecipientCommand::Add { display_name, email, phone, push_token, webhook_url }) => {
-            let args = commands::recipient::AddArgs { display_name, email, phone, push_token, webhook_url };
+        Command::Recipient(RecipientCommand::Add {
+            tenant,
+            display_name,
+            email,
+            phone,
+            push_token,
+            webhook_url,
+        }) => {
+            let args = commands::recipient::AddArgs {
+                tenant_id: tenant,
+                display_name,
+                email,
+                phone,
+                push_token,
+                webhook_url,
+            };
             commands::recipient::add(&storage, args, cli.output).await?
         }
         Command::Recipient(RecipientCommand::Show { id }) => {

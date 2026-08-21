@@ -54,6 +54,11 @@ pub enum Command {
 pub enum RecipientCommand {
     /// Register a recipient and the addresses it can be reached on.
     Add {
+        /// The tenant this recipient belongs to. Only that tenant's keys
+        /// can send to it.
+        #[arg(long)]
+        tenant: Uuid,
+
         #[arg(long)]
         display_name: Option<String>,
 

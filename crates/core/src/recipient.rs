@@ -68,13 +68,33 @@ impl RecipientAddress {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Recipient {
     pub id: Uuid,
+    /// The tenant this recipient belongs to.
+    ///
+    /// Recipients predate multi-tenancy in this service, so stored rows
+    /// written before it have no tenant in their JSON and deserialize to
+    /// the nil UUID. That is deliberately a tenant no API key can ever
+    /// hold: such a recipient is visible to nobody rather than to
+    /// everybody, so the gap fails closed and an operator re-registers the
+    /// handful of rows affected.
+    #[serde(default)]
+    pub tenant_id: Uuid,
     pub display_name: Option<String>,
     addresses: HashMap<ChannelKind, RecipientAddress>,
 }
 
 impl Recipient {
-    pub fn new(id: Uuid) -> Self {
-        Self { id, display_name: None, addresses: HashMap::new() }
+    pub fn new(id: Uuid, tenant_id: Uuid) -> Self {
+        Self { id, tenant_id, display_name: None, addresses: HashMap::new() }
+    }
+
+    /// Whether this recipient may be addressed by `tenant_id`.
+    ///
+    /// A recipient with the nil tenant belongs to no one and answers
+    /// `false` for every tenant, including the nil one -- a caller can't
+    /// hold a nil-tenant key by accident, but spelling the rule out here
+    /// means the check can't be defeated by one that somehow does.
+    pub fn belongs_to(&self, tenant_id: Uuid) -> bool {
+        !self.tenant_id.is_nil() && self.tenant_id == tenant_id
     }
 
     pub fn with_display_name(mut self, name: impl Into<String>) -> Self {
@@ -106,7 +126,7 @@ mod tests {
     use super::*;
 
     fn valid_recipient() -> Recipient {
-        Recipient::new(Uuid::new_v4())
+        Recipient::new(Uuid::new_v4(), Uuid::new_v4())
             .with_display_name("Ada Lovelace")
             .with_address(RecipientAddress::Email("ada@example.com".into()))
             .unwrap()
@@ -125,7 +145,7 @@ mod tests {
 
     #[test]
     fn missing_address_errors() {
-        let r = Recipient::new(Uuid::new_v4());
+        let r = Recipient::new(Uuid::new_v4(), Uuid::new_v4());
         let err = r.address_for(ChannelKind::Email).unwrap_err();
         assert!(matches!(err, CoreError::MissingAddress(ChannelKind::Email)));
     }
@@ -156,6 +176,33 @@ mod tests {
     fn webhook_requires_scheme() {
         assert!(RecipientAddress::WebhookUrl("example.com/hook".into()).validate().is_err());
         assert!(RecipientAddress::WebhookUrl("https://example.com/hook".into()).validate().is_ok());
+    }
+
+    #[test]
+    fn a_recipient_belongs_only_to_its_own_tenant() {
+        let tenant = Uuid::new_v4();
+        let recipient = Recipient::new(Uuid::new_v4(), tenant);
+        assert!(recipient.belongs_to(tenant));
+        assert!(!recipient.belongs_to(Uuid::new_v4()));
+    }
+
+    #[test]
+    fn a_recipient_stored_before_multi_tenancy_belongs_to_nobody() {
+        let legacy: Recipient = serde_json::from_str(
+            r#"{"id":"00000000-0000-0000-0000-0000000000ff","display_name":null,"addresses":{}}"#,
+        )
+        .unwrap();
+
+        assert!(legacy.tenant_id.is_nil());
+        assert!(!legacy.belongs_to(Uuid::new_v4()));
+        assert!(!legacy.belongs_to(Uuid::nil()), "the gap has to fail closed, not open");
+    }
+
+    #[test]
+    fn tenant_round_trips_through_serde() {
+        let recipient = valid_recipient();
+        let json = serde_json::to_string(&recipient).unwrap();
+        assert_eq!(serde_json::from_str::<Recipient>(&json).unwrap(), recipient);
     }
 
     #[test]

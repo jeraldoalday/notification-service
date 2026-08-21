@@ -11,6 +11,7 @@ use crate::output::OutputFormat;
 /// delivery attempts later.
 #[derive(Debug, Default)]
 pub struct AddArgs {
+    pub tenant_id: Uuid,
     pub display_name: Option<String>,
     pub email: Option<String>,
     pub phone: Option<String>,
@@ -47,7 +48,7 @@ pub async fn add(storage: &SqliteStorage, args: AddArgs, output: OutputFormat) -
         ));
     }
 
-    let mut recipient = Recipient::new(Uuid::new_v4());
+    let mut recipient = Recipient::new(Uuid::new_v4(), args.tenant_id);
     if let Some(name) = args.display_name {
         recipient = recipient.with_display_name(name);
     }
@@ -66,6 +67,7 @@ pub async fn show(storage: &SqliteStorage, id: Uuid, output: OutputFormat) -> Cl
 
 fn describe(recipient: &Recipient) -> String {
     let mut out = format!("id: {}\n", recipient.id);
+    out.push_str(&format!("tenant: {}\n", recipient.tenant_id));
     if let Some(name) = &recipient.display_name {
         out.push_str(&format!("name: {name}\n"));
     }

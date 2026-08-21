@@ -361,7 +361,7 @@ mod tests {
             ChannelKind::Push => RecipientAddress::PushToken("device-token".into()),
             ChannelKind::Webhook => RecipientAddress::WebhookUrl("https://example.com/hook".into()),
         };
-        let recipient = Recipient::new(Uuid::new_v4()).with_address(address).unwrap();
+        let recipient = Recipient::new(Uuid::new_v4(), Uuid::new_v4()).with_address(address).unwrap();
         repo.insert_recipient(&recipient).await.unwrap();
         recipient.id
     }

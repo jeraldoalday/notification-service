@@ -4,10 +4,18 @@ use axum::http::StatusCode;
 use serde_json::{json, Value};
 use support::{get, json_body, post_json, send, test_app};
 
+/// The tenant every test in this file works under. Recipients are
+/// tenant-scoped, so the recipient a test registers has to belong to the
+/// tenant its notifications are submitted for.
+const TENANT: &str = "11111111-1111-1111-1111-111111111111";
+
 async fn create_recipient(app: &axum::Router) -> String {
     let response = send(
         app,
-        post_json("/recipients", json!({"addresses": [{"type": "email", "value": "ada@example.com"}]})),
+        post_json(
+            "/recipients",
+            json!({"tenant_id": TENANT, "addresses": [{"type": "email", "value": "ada@example.com"}]}),
+        ),
     )
     .await;
     let body: Value = json_body(response).await;
@@ -238,8 +246,6 @@ async fn submitted_notification_defaults_to_normal_priority_and_five_attempts() 
     assert_eq!(created["max_attempts"], 5);
     assert_eq!(created["attempt_count"], 0);
 }
-
-const TENANT: &str = "11111111-1111-1111-1111-111111111111";
 
 /// Registers a template under `TENANT` that needs one variable.
 async fn create_template(app: &axum::Router, id: &str, channel: Option<&str>) {

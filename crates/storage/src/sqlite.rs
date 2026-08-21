@@ -480,7 +480,7 @@ mod tests {
     }
 
     fn sample_recipient() -> Recipient {
-        Recipient::new(Uuid::new_v4())
+        Recipient::new(Uuid::new_v4(), Uuid::new_v4())
             .with_display_name("Ada Lovelace")
             .with_address(RecipientAddress::Email("ada@example.com".into()))
             .unwrap()

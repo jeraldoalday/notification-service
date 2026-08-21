@@ -12,7 +12,7 @@ use support::test_storage;
 use uuid::Uuid;
 
 async fn seed_recipient(storage: &SqliteStorage) -> Uuid {
-    let recipient = Recipient::new(Uuid::new_v4())
+    let recipient = Recipient::new(Uuid::new_v4(), Uuid::new_v4())
         .with_address(RecipientAddress::Email("ada@example.com".into()))
         .unwrap();
     storage.insert_recipient(&recipient).await.unwrap();

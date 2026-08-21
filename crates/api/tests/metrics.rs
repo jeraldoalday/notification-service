@@ -15,12 +15,13 @@ async fn scrape(router: &axum::Router) -> String {
     text_body(response).await
 }
 
-async fn create_recipient(router: &axum::Router) -> uuid::Uuid {
+async fn create_recipient(router: &axum::Router, tenant_id: uuid::Uuid) -> uuid::Uuid {
     let response = send(
         router,
         post_json(
             "/recipients",
             serde_json::json!({
+                "tenant_id": tenant_id,
                 "display_name": "Ada",
                 "addresses": [{"type": "email", "value": "ada@example.com"}]
             }),
@@ -46,14 +47,15 @@ async fn metrics_endpoint_exposes_the_full_metric_set_before_any_traffic() {
 #[tokio::test]
 async fn submitting_a_notification_increments_its_channel_counter() {
     let (router, _dir) = test_app().await;
-    let recipient_id = create_recipient(&router).await;
+    let tenant_id = uuid::Uuid::new_v4();
+    let recipient_id = create_recipient(&router, tenant_id).await;
 
     let response = send(
         &router,
         post_json(
             "/notifications",
             serde_json::json!({
-                "tenant_id": uuid::Uuid::new_v4(),
+                "tenant_id": tenant_id,
                 "recipient_id": recipient_id,
                 "channel": "email",
                 "subject": "Hi",
@@ -72,7 +74,8 @@ async fn submitting_a_notification_increments_its_channel_counter() {
 #[tokio::test]
 async fn queue_depth_is_refreshed_at_scrape_time() {
     let (router, _dir) = test_app().await;
-    let recipient_id = create_recipient(&router).await;
+    let tenant_id = uuid::Uuid::new_v4();
+    let recipient_id = create_recipient(&router, tenant_id).await;
 
     assert!(scrape(&router).await.contains("ns_queue_notifications{status=\"queued\"} 0"));
 
@@ -82,7 +85,7 @@ async fn queue_depth_is_refreshed_at_scrape_time() {
             post_json(
                 "/notifications",
                 serde_json::json!({
-                    "tenant_id": uuid::Uuid::new_v4(),
+                    "tenant_id": tenant_id,
                     "recipient_id": recipient_id,
                     "channel": "email",
                     "body": "Hello"

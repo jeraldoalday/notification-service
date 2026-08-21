@@ -141,19 +141,27 @@ async fn listing_only_ever_returns_the_callers_own_tenant() {
     let ours = issue_key(&storage, our_tenant, &[Scope::Write]).await;
     let theirs = issue_key(&storage, their_tenant, &[Scope::Write]).await;
 
-    let recipient_id = create_recipient(&router, &ours).await;
+    // Each tenant registers its own recipient: a recipient belongs to one
+    // tenant, so reusing ours for their submission is refused -- which is
+    // what the test below this one is about.
+    let ours_recipient = create_recipient(&router, &ours).await;
+    let theirs_recipient = create_recipient(&router, &theirs).await;
     submit(
         &router,
         &ours,
-        serde_json::json!({"recipient_id": recipient_id, "channel": "email", "body": "a"}),
+        serde_json::json!({"recipient_id": ours_recipient, "channel": "email", "body": "a"}),
     )
     .await;
-    submit(&router, &ours, serde_json::json!({"recipient_id": recipient_id, "channel": "sms", "body": "b"}))
-        .await;
+    submit(
+        &router,
+        &ours,
+        serde_json::json!({"recipient_id": ours_recipient, "channel": "sms", "body": "b"}),
+    )
+    .await;
     submit(
         &router,
         &theirs,
-        serde_json::json!({"recipient_id": recipient_id, "channel": "push", "body": "c"}),
+        serde_json::json!({"recipient_id": theirs_recipient, "channel": "push", "body": "c"}),
     )
     .await;
 
@@ -161,6 +169,33 @@ async fn listing_only_ever_returns_the_callers_own_tenant() {
         json_body(send(&router, with_auth(get("/notifications"), &theirs)).await).await;
     assert_eq!(listed.len(), 1, "{listed:?}");
     assert_eq!(listed[0]["tenant_id"].as_str().unwrap().parse::<Uuid>().unwrap(), their_tenant);
+}
+
+#[tokio::test]
+async fn a_notification_cannot_be_sent_to_another_tenants_recipient() {
+    let (router, _dir, storage) = test_app_with_auth().await;
+    let ours = issue_key(&storage, Uuid::new_v4(), &[Scope::Write]).await;
+    let theirs = issue_key(&storage, Uuid::new_v4(), &[Scope::Write]).await;
+
+    let their_recipient = create_recipient(&router, &theirs).await;
+
+    let response = send(
+        &router,
+        with_auth(
+            post_json(
+                "/notifications",
+                serde_json::json!({"recipient_id": their_recipient, "channel": "email", "body": "Hello"}),
+            ),
+            &ours,
+        ),
+    )
+    .await;
+
+    assert_eq!(
+        response.status(),
+        StatusCode::NOT_FOUND,
+        "otherwise a caller could reach an address it was never given, just by guessing an id"
+    );
 }
 
 #[tokio::test]

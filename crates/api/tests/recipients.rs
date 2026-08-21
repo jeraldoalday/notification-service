@@ -11,6 +11,7 @@ async fn creates_and_fetches_a_recipient() {
     let create = post_json(
         "/recipients",
         json!({
+            "tenant_id": "11111111-1111-1111-1111-111111111111",
             "display_name": "Ada Lovelace",
             "addresses": [{"type": "email", "value": "ada@example.com"}]
         }),
@@ -32,7 +33,9 @@ async fn creates_and_fetches_a_recipient() {
 async fn create_recipient_without_addresses_defaults_to_empty() {
     let (app, _dir) = test_app().await;
 
-    let response = send(&app, post_json("/recipients", json!({}))).await;
+    let response =
+        send(&app, post_json("/recipients", json!({"tenant_id": "11111111-1111-1111-1111-111111111111"})))
+            .await;
 
     assert_eq!(response.status(), StatusCode::CREATED);
     let created: Value = json_body(response).await;

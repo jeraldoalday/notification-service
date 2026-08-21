@@ -123,7 +123,14 @@ where
 
     // Fail fast with a 404 rather than letting a bad recipient_id surface
     // only once the worker tries (and fails) to dispatch the notification.
-    state.repo.get_recipient(request.recipient_id).await?;
+    // The tenant check rides along here: sending to someone else's
+    // recipient is the one way a caller could otherwise reach an address
+    // it was never given, and it answers 404 so that guessing recipient
+    // ids tells an attacker nothing about which ones exist.
+    let recipient = state.repo.get_recipient(request.recipient_id).await?;
+    if caller.tenant_id().is_some() && !recipient.belongs_to(tenant_id) {
+        return Err(ApiError::NotFound(format!("recipient {} not found", request.recipient_id)));
+    }
 
     let mut builder =
         Notification::builder(tenant_id, request.recipient_id, request.channel).priority(request.priority);
