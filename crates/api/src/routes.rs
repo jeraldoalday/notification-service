@@ -7,6 +7,7 @@ use tower_http::trace::TraceLayer;
 
 use crate::state::AppState;
 
+pub mod api_keys;
 mod health;
 pub mod notifications;
 pub mod recipients;
@@ -56,6 +57,8 @@ where
             get(templates::get_template).put(templates::update_template).delete(templates::delete_template),
         )
         .route("/templates/{id}/preview", post(templates::preview_template))
+        .route("/api-keys", post(api_keys::create_api_key).get(api_keys::list_api_keys))
+        .route("/api-keys/{id}", axum::routing::delete(api_keys::revoke_api_key))
         // route_layer, so a request for an unknown path is a plain 404
         // rather than a 401 that invites guessing at which paths exist.
         .route_layer(axum::middleware::from_fn_with_state(state.clone(), crate::auth::authenticate));
