@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use axum::routing::{get, post};
 use axum::Router;
 use ns_storage::{NotificationRepository, RecipientRepository, TemplateRepository};
@@ -18,8 +20,11 @@ pub fn build_router<R>(state: AppState<R>) -> Router
 where
     R: NotificationRepository + RecipientRepository + TemplateRepository + Clone + Send + Sync + 'static,
 {
+    let metrics = Arc::clone(&state.metrics);
+
     Router::new()
         .route("/health", get(health::health))
+        .route("/metrics", get(crate::metrics::metrics_endpoint))
         .route("/recipients", post(recipients::create_recipient))
         .route("/recipients/{id}", get(recipients::get_recipient))
         .route(
@@ -35,5 +40,10 @@ where
         )
         .route("/templates/{id}/preview", post(templates::preview_template))
         .layer(TraceLayer::new_for_http())
+        // Applied outside TraceLayer so the recorded duration covers the
+        // whole response, and applied via `Router::layer` (not
+        // `route_layer`) so unmatched requests are counted too -- a flood
+        // of 404s is exactly the sort of thing a scrape should show.
+        .layer(axum::middleware::from_fn_with_state(metrics, crate::metrics::track_requests))
         .with_state(state)
 }

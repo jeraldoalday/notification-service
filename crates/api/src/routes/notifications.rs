@@ -130,6 +130,11 @@ where
     }
 
     let submitted = state.queue.submit(notification, Utc::now()).await?;
+    // Counted here rather than inside NotificationQueue::submit so the
+    // number means "accepted from a caller", not "written to storage" --
+    // the queue's own submit is also what replay uses to re-enqueue work
+    // that was already counted once.
+    state.metrics.record_submitted(submitted.channel);
     Ok((StatusCode::CREATED, Json(submitted.into())))
 }
 

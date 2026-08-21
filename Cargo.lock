@@ -1389,6 +1389,7 @@ dependencies = [
  "http-body-util",
  "ns-config",
  "ns-core",
+ "ns-metrics",
  "ns-queue",
  "ns-storage",
  "ns-templates",

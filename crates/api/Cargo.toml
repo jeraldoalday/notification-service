@@ -12,6 +12,7 @@ ns-storage = { path = "../storage" }
 ns-queue = { path = "../queue" }
 ns-templates = { path = "../templates" }
 ns-config = { path = "../config" }
+ns-metrics = { path = "../metrics" }
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
