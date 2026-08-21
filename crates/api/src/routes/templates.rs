@@ -4,12 +4,14 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use chrono::{DateTime, Utc};
+use ns_auth::Scope;
 use ns_core::ChannelKind;
-use ns_storage::{NotificationRepository, RecipientRepository, TemplateRepository};
+use ns_storage::{ApiKeyRepository, NotificationRepository, RecipientRepository, TemplateRepository};
 use ns_templates::{Template, TemplateError};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::auth::Caller;
 use crate::error::{ApiError, ApiJson, ApiResult};
 use crate::state::AppState;
 
@@ -24,18 +26,20 @@ const MAX_LIST_LIMIT: u32 = 500;
 /// identity and the tenant a scope, matching `GET /notifications`.
 #[derive(Debug, Deserialize)]
 pub struct TenantQuery {
-    pub tenant_id: Uuid,
+    /// Optional when authenticated, for the same reason it is on
+    /// notifications: the key already names the tenant.
+    pub tenant_id: Option<Uuid>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct ListTemplatesQuery {
-    pub tenant_id: Uuid,
+    pub tenant_id: Option<Uuid>,
     pub limit: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
 pub struct CreateTemplateRequest {
-    pub tenant_id: Uuid,
+    pub tenant_id: Option<Uuid>,
     pub id: String,
     pub name: Option<String>,
     pub channel: Option<ChannelKind>,
@@ -85,8 +89,8 @@ fn to_response(template: Template) -> ApiResult<TemplateResponse> {
     })
 }
 
-fn build_template(request: CreateTemplateRequest) -> ApiResult<Template> {
-    let mut template = Template::new(request.tenant_id, request.id, request.body)?;
+fn build_template(tenant_id: Uuid, request: CreateTemplateRequest) -> ApiResult<Template> {
+    let mut template = Template::new(tenant_id, request.id, request.body)?;
     if let Some(name) = request.name {
         template = template.with_name(name);
     }
@@ -101,12 +105,16 @@ fn build_template(request: CreateTemplateRequest) -> ApiResult<Template> {
 
 pub async fn create_template<R>(
     State(state): State<AppState<R>>,
+    caller: Caller,
     ApiJson(request): ApiJson<CreateTemplateRequest>,
 ) -> ApiResult<(StatusCode, Json<TemplateResponse>)>
 where
-    R: NotificationRepository + RecipientRepository + TemplateRepository + Clone,
+    R: NotificationRepository + RecipientRepository + TemplateRepository + ApiKeyRepository + Clone,
 {
-    let template = build_template(request)?;
+    caller.require(Scope::Write)?;
+    let tenant_id = caller.tenant_for(request.tenant_id)?;
+
+    let template = build_template(tenant_id, request)?;
     // A 409 rather than an overwrite: silently replacing a template would
     // change the wording of every notification already queued against it.
     state.repo.insert_template(&template).await?;
@@ -115,25 +123,30 @@ where
 
 pub async fn get_template<R>(
     State(state): State<AppState<R>>,
+    caller: Caller,
     Path(id): Path<String>,
     Query(query): Query<TenantQuery>,
 ) -> ApiResult<Json<TemplateResponse>>
 where
-    R: NotificationRepository + RecipientRepository + TemplateRepository + Clone,
+    R: NotificationRepository + RecipientRepository + TemplateRepository + ApiKeyRepository + Clone,
 {
-    let template = state.repo.get_template(query.tenant_id, &id).await?;
+    caller.require(Scope::Read)?;
+    let template = state.repo.get_template(caller.tenant_for(query.tenant_id)?, &id).await?;
     Ok(Json(to_response(template)?))
 }
 
 pub async fn list_templates<R>(
     State(state): State<AppState<R>>,
+    caller: Caller,
     Query(query): Query<ListTemplatesQuery>,
 ) -> ApiResult<Json<Vec<TemplateResponse>>>
 where
-    R: NotificationRepository + RecipientRepository + TemplateRepository + Clone,
+    R: NotificationRepository + RecipientRepository + TemplateRepository + ApiKeyRepository + Clone,
 {
+    caller.require(Scope::Read)?;
+    let tenant_id = caller.tenant_for(query.tenant_id)?;
     let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT).min(MAX_LIST_LIMIT);
-    let templates = state.repo.list_templates(query.tenant_id, limit).await?;
+    let templates = state.repo.list_templates(tenant_id, limit).await?;
     templates.into_iter().map(to_response).collect::<ApiResult<Vec<_>>>().map(Json)
 }
 
@@ -143,14 +156,16 @@ where
 /// still referencing the old id keep resolving until they're drained.
 pub async fn update_template<R>(
     State(state): State<AppState<R>>,
+    caller: Caller,
     Path(id): Path<String>,
     Query(query): Query<TenantQuery>,
     ApiJson(request): ApiJson<UpdateTemplateRequest>,
 ) -> ApiResult<Json<TemplateResponse>>
 where
-    R: NotificationRepository + RecipientRepository + TemplateRepository + Clone,
+    R: NotificationRepository + RecipientRepository + TemplateRepository + ApiKeyRepository + Clone,
 {
-    let mut template = state.repo.get_template(query.tenant_id, &id).await?;
+    caller.require(Scope::Write)?;
+    let mut template = state.repo.get_template(caller.tenant_for(query.tenant_id)?, &id).await?;
     template.revise(request.subject, request.body, Utc::now())?;
     template.name = request.name;
     template.channel = request.channel;
@@ -161,13 +176,15 @@ where
 
 pub async fn delete_template<R>(
     State(state): State<AppState<R>>,
+    caller: Caller,
     Path(id): Path<String>,
     Query(query): Query<TenantQuery>,
 ) -> ApiResult<StatusCode>
 where
-    R: NotificationRepository + RecipientRepository + TemplateRepository + Clone,
+    R: NotificationRepository + RecipientRepository + TemplateRepository + ApiKeyRepository + Clone,
 {
-    state.repo.delete_template(query.tenant_id, &id).await?;
+    caller.require(Scope::Write)?;
+    state.repo.delete_template(caller.tenant_for(query.tenant_id)?, &id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -191,14 +208,16 @@ pub struct PreviewTemplateResponse {
 /// a template needs four variables.
 pub async fn preview_template<R>(
     State(state): State<AppState<R>>,
+    caller: Caller,
     Path(id): Path<String>,
     Query(query): Query<TenantQuery>,
     ApiJson(request): ApiJson<PreviewTemplateRequest>,
 ) -> ApiResult<Json<PreviewTemplateResponse>>
 where
-    R: NotificationRepository + RecipientRepository + TemplateRepository + Clone,
+    R: NotificationRepository + RecipientRepository + TemplateRepository + ApiKeyRepository + Clone,
 {
-    let template = state.repo.get_template(query.tenant_id, &id).await?;
+    caller.require(Scope::Read)?;
+    let template = state.repo.get_template(caller.tenant_for(query.tenant_id)?, &id).await?;
 
     let missing = template.missing_variables(&request.vars)?;
     if !missing.is_empty() {

@@ -4,13 +4,31 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::Json;
 use chrono::{DateTime, Utc};
+use ns_auth::Scope;
 use ns_core::{ChannelKind, DeliveryStatus, Notification, Priority};
-use ns_storage::{NotificationRepository, RecipientRepository, TemplateRepository};
+use ns_storage::{ApiKeyRepository, NotificationRepository, RecipientRepository, TemplateRepository};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::error::{ApiJson, ApiResult};
+use crate::auth::Caller;
+use crate::error::{ApiError, ApiJson, ApiResult};
 use crate::state::AppState;
+
+/// Turns "this belongs to another tenant" into "this doesn't exist" for
+/// lookups by id.
+///
+/// A 403 here would confirm that the id names a real notification, which
+/// is exactly the thing another tenant shouldn't be able to learn -- and
+/// unlike a `tenant_id` the caller supplied explicitly (where a 403 tells
+/// a misconfigured client something useful about its own request), an id
+/// that resolves to someone else's row is indistinguishable, from the
+/// caller's side, from an id that resolves to nothing.
+fn hide_other_tenants<T>(result: ApiResult<T>, missing: impl FnOnce() -> String) -> ApiResult<T> {
+    match result {
+        Err(ApiError::Auth(ns_auth::AuthError::WrongTenant { .. })) => Err(ApiError::NotFound(missing())),
+        other => other,
+    }
+}
 
 /// Applied when a `GET /notifications` request omits `limit`, so an
 /// unbounded query can't be used to pull an entire tenant's history in one
@@ -27,7 +45,9 @@ const MAX_LIST_LIMIT: u32 = 500;
 
 #[derive(Debug, Deserialize)]
 pub struct SubmitNotificationRequest {
-    pub tenant_id: Uuid,
+    /// Optional when authenticated: the key already names the tenant, and
+    /// supplying one that disagrees is refused rather than overridden.
+    pub tenant_id: Option<Uuid>,
     pub recipient_id: Uuid,
     pub channel: ChannelKind,
     #[serde(default)]
@@ -92,17 +112,21 @@ impl From<Notification> for NotificationResponse {
 /// a validity check.
 pub async fn submit_notification<R>(
     State(state): State<AppState<R>>,
+    caller: Caller,
     ApiJson(request): ApiJson<SubmitNotificationRequest>,
 ) -> ApiResult<(StatusCode, Json<NotificationResponse>)>
 where
-    R: NotificationRepository + RecipientRepository + TemplateRepository + Clone,
+    R: NotificationRepository + RecipientRepository + TemplateRepository + ApiKeyRepository + Clone,
 {
+    caller.require(Scope::Write)?;
+    let tenant_id = caller.tenant_for(request.tenant_id)?;
+
     // Fail fast with a 404 rather than letting a bad recipient_id surface
     // only once the worker tries (and fails) to dispatch the notification.
     state.repo.get_recipient(request.recipient_id).await?;
 
-    let mut builder = Notification::builder(request.tenant_id, request.recipient_id, request.channel)
-        .priority(request.priority);
+    let mut builder =
+        Notification::builder(tenant_id, request.recipient_id, request.channel).priority(request.priority);
     if let Some(subject) = request.subject {
         builder = builder.subject(subject);
     }
@@ -140,12 +164,17 @@ where
 
 pub async fn get_notification<R>(
     State(state): State<AppState<R>>,
+    caller: Caller,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<NotificationResponse>>
 where
-    R: NotificationRepository + RecipientRepository + TemplateRepository + Clone,
+    R: NotificationRepository + RecipientRepository + TemplateRepository + ApiKeyRepository + Clone,
 {
+    caller.require(Scope::Read)?;
     let notification = state.repo.get_notification(id).await?;
+    hide_other_tenants(caller.require_tenant(notification.tenant_id), || {
+        format!("notification {id} not found")
+    })?;
     Ok(Json(notification.into()))
 }
 
@@ -156,12 +185,17 @@ where
 /// 409 via `CoreError::InvalidTransition` rather than silently no-opping.
 pub async fn cancel_notification<R>(
     State(state): State<AppState<R>>,
+    caller: Caller,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<NotificationResponse>>
 where
-    R: NotificationRepository + RecipientRepository + TemplateRepository + Clone,
+    R: NotificationRepository + RecipientRepository + TemplateRepository + ApiKeyRepository + Clone,
 {
+    caller.require(Scope::Write)?;
     let mut notification = state.repo.get_notification(id).await?;
+    hide_other_tenants(caller.require_tenant(notification.tenant_id), || {
+        format!("notification {id} not found")
+    })?;
     notification.transition(DeliveryStatus::Cancelled, Utc::now())?;
     state.repo.update_notification(&notification).await?;
     Ok(Json(notification.into()))
@@ -169,19 +203,22 @@ where
 
 #[derive(Debug, Deserialize)]
 pub struct ListNotificationsQuery {
-    pub tenant_id: Uuid,
+    pub tenant_id: Option<Uuid>,
     pub status: Option<DeliveryStatus>,
     pub limit: Option<u32>,
 }
 
 pub async fn list_notifications<R>(
     State(state): State<AppState<R>>,
+    caller: Caller,
     Query(query): Query<ListNotificationsQuery>,
 ) -> ApiResult<Json<Vec<NotificationResponse>>>
 where
-    R: NotificationRepository + RecipientRepository + TemplateRepository + Clone,
+    R: NotificationRepository + RecipientRepository + TemplateRepository + ApiKeyRepository + Clone,
 {
+    caller.require(Scope::Read)?;
+    let tenant_id = caller.tenant_for(query.tenant_id)?;
     let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT).min(MAX_LIST_LIMIT);
-    let notifications = state.repo.list_by_tenant(query.tenant_id, query.status, limit).await?;
+    let notifications = state.repo.list_by_tenant(tenant_id, query.status, limit).await?;
     Ok(Json(notifications.into_iter().map(NotificationResponse::from).collect()))
 }

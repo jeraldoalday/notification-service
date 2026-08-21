@@ -1,11 +1,13 @@
 use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use axum::Json;
+use ns_auth::Scope;
 use ns_core::{Recipient, RecipientAddress};
-use ns_storage::{NotificationRepository, RecipientRepository, TemplateRepository};
+use ns_storage::{ApiKeyRepository, NotificationRepository, RecipientRepository, TemplateRepository};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+use crate::auth::Caller;
 use crate::error::{ApiJson, ApiResult};
 use crate::state::AppState;
 
@@ -35,11 +37,14 @@ impl From<Recipient> for RecipientResponse {
 
 pub async fn create_recipient<R>(
     State(state): State<AppState<R>>,
+    caller: Caller,
     ApiJson(request): ApiJson<CreateRecipientRequest>,
 ) -> ApiResult<(StatusCode, Json<RecipientResponse>)>
 where
-    R: NotificationRepository + RecipientRepository + TemplateRepository + Clone,
+    R: NotificationRepository + RecipientRepository + TemplateRepository + ApiKeyRepository + Clone,
 {
+    caller.require(Scope::Write)?;
+
     let mut recipient = Recipient::new(Uuid::new_v4());
     if let Some(name) = request.display_name {
         recipient = recipient.with_display_name(name);
@@ -54,11 +59,13 @@ where
 
 pub async fn get_recipient<R>(
     State(state): State<AppState<R>>,
+    caller: Caller,
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<RecipientResponse>>
 where
-    R: NotificationRepository + RecipientRepository + TemplateRepository + Clone,
+    R: NotificationRepository + RecipientRepository + TemplateRepository + ApiKeyRepository + Clone,
 {
+    caller.require(Scope::Read)?;
     let recipient = state.repo.get_recipient(id).await?;
     Ok(Json(recipient.into()))
 }
