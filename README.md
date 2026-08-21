@@ -12,7 +12,8 @@ overall design and current build status.
 
 Early and under active development. The domain model, configuration layer,
 SQLite storage layer, job queue, channel providers, worker process, HTTP
-API, notification templates, and the `ns` admin CLI are in place.
+API, notification templates, the `ns` admin CLI, Prometheus metrics, and
+API-key authentication with per-tenant isolation are all in place.
 
 ## Workspace layout
 
@@ -24,6 +25,8 @@ crates/
   queue/    ns-queue    -- job queue: submit, claim-for-processing, complete/fail with backoff
   channels/ ns-channels -- email, SMS, push, and webhook delivery behind a shared trait
   templates/ns-templates -- reusable {{variable}} message templates, rendered at send time
+  metrics/  ns-metrics  -- counters, gauges and latency histograms, exposed as Prometheus text
+  auth/     ns-auth     -- API keys, scopes and the tenant a request acts for
   worker/   ns-worker   -- dequeues due notifications and dispatches them, with per-channel rate limiting and circuit breaking
   api/      ns-api      -- axum HTTP API for submitting notifications and querying delivery status
   cli/      ns-cli      -- the `ns` admin binary: submit test notifications, inspect the queue, manage templates
@@ -45,7 +48,8 @@ database, and serves on `NS_SERVER_HOST:NS_SERVER_PORT` (default
 
 | Method | Path                        | Description                                   |
 | ------ | --------------------------- | ---------------------------------------------- |
-| GET    | `/health`                   | Liveness check                                 |
+| GET    | `/health`                   | Liveness check (no credential)                 |
+| GET    | `/metrics`                  | Prometheus exposition (no credential)          |
 | POST   | `/recipients`                | Register a recipient and its channel addresses |
 | GET    | `/recipients/{id}`           | Fetch a recipient                              |
 | POST   | `/notifications`             | Submit a notification (queues it for delivery) |
@@ -58,13 +62,85 @@ database, and serves on `NS_SERVER_HOST:NS_SERVER_PORT` (default
 | PUT    | `/templates/{id}?tenant_id=` | Replace a template's subject and body          |
 | DELETE | `/templates/{id}?tenant_id=` | Delete a template                              |
 | POST   | `/templates/{id}/preview?tenant_id=` | Render a template against candidate variables |
+| POST   | `/api-keys`                  | Mint an API key for the caller's tenant (admin) |
+| GET    | `/api-keys`                  | List the caller's tenant's keys (admin)        |
+| DELETE | `/api-keys/{id}`             | Revoke a key (admin)                           |
 
 Errors are returned as `{"error": "..."}` with an appropriate status code --
-`400` for validation failures (including malformed JSON), `404` for unknown
-ids, `409` for an illegal status transition (e.g. cancelling a notification
-that's already `Sending`) or a template id that already exists, `422` for a
-recipient missing an address for the requested channel or a template
-missing the variables it needs.
+`400` for validation failures (including malformed JSON), `401` for a
+missing or unusable credential, `403` for a valid key that isn't allowed to
+do this, `404` for unknown ids, `409` for an illegal status transition (e.g.
+cancelling a notification that's already `Sending`) or a template id that
+already exists, `422` for a recipient missing an address for the requested
+channel or a template missing the variables it needs.
+
+## Authentication and tenancy
+
+Every endpoint except `/health` and `/metrics` requires an API key:
+
+```sh
+curl localhost:8080/notifications -H "Authorization: Bearer nsk_..."
+```
+
+Mint the first one with the CLI, which reaches the database directly and
+so doesn't need a key of its own:
+
+```sh
+cargo run -p ns-cli --bin ns -- apikey create \
+    --tenant $T --name ci-deploy --scope write
+```
+
+The token is printed once and stored only as a SHA-256 digest -- there is
+no way to read it back, so an operator who loses it mints a replacement
+and revokes the old key. Keys carry one or more scopes: `read` (observe),
+`write` (submit, cancel, edit -- and implies `read`), and `admin` (manage
+keys). After the first key exists, the `/api-keys` endpoints do the same
+job over HTTP.
+
+A key belongs to exactly one tenant, and that is the tenant its requests
+act for. `tenant_id` is therefore optional on every request body and query
+string: supply it and it must agree with the key, or you get a `403`
+rather than a silent override. Notifications, templates and recipients
+belonging to another tenant answer `404`, so ids can't be used to probe
+for what exists.
+
+For a single-tenant deployment on a private network, `auth.enabled =
+false` (or `NS_AUTH_ENABLED=false`) turns credential checking off
+entirely; requests then name their own `tenant_id`. The serve binary logs
+a warning at startup whenever it comes up that way.
+
+## Metrics
+
+`GET /metrics` serves Prometheus text exposition covering both halves of
+the service:
+
+| Metric | Type | Labels |
+| ------ | ---- | ------ |
+| `ns_notifications_submitted_total` | counter | `channel` |
+| `ns_notification_attempts_total` | counter | `channel`, `outcome` |
+| `ns_notification_skipped_total` | counter | `channel`, `reason` |
+| `ns_notification_send_duration_seconds` | histogram | `channel` |
+| `ns_queue_notifications` | gauge | `status` |
+| `ns_worker_polls_total`, `ns_worker_claimed_total` | counter | -- |
+| `ns_http_requests_total` | counter | `method`, `route`, `status` |
+| `ns_http_request_duration_seconds` | histogram | `method`, `route` |
+| `ns_http_requests_in_flight` | gauge | -- |
+
+Every series a closed enum can produce exists from startup, so a channel
+that has seen no traffic reports an explicit `0` rather than a gap. The
+`route` label is the matched route pattern (`/notifications/{id}`), never
+the concrete path, and no metric carries a tenant label -- which is part
+of why `/metrics` can be served without a credential.
+
+To export them from a process that also runs the worker, share one
+`ServiceMetrics` between both halves:
+
+```rust
+let metrics = Arc::new(ServiceMetrics::new());
+let state = AppState::with_metrics(storage.clone(), Arc::clone(&metrics));
+let worker = Worker::new(storage, channels, rate_limiter, breaker)
+    .with_metrics(metrics);
+```
 
 ## Templates
 
@@ -100,7 +176,9 @@ cargo run -p ns-cli --bin ns -- queue stats
 ```
 
 ```sh
-ns recipient add --email ada@example.com --display-name "Ada Lovelace"
+ns apikey create --tenant $T --name ci-deploy --scope write
+ns apikey list --tenant $T
+ns recipient add --tenant $T --email ada@example.com --display-name "Ada Lovelace"
 ns notification submit --tenant $T --recipient $R --channel email \
     --template order_shipped --var name=Ada --var order_id=1234
 ns notification list --tenant $T --status dead_lettered
@@ -153,7 +231,8 @@ Settings are loaded from a TOML file (see `config/default.toml` for the
 full set of keys and their defaults) and can be overridden per-key with
 `NS_*` environment variables, e.g. `NS_SERVER_PORT=9090`. See
 `crates/config/src/loader.rs` for the full list of recognized keys,
-including `NS_QUEUE_MAX_RETRY_ATTEMPTS` and `NS_SMTP_FROM_ADDRESS`.
+including `NS_QUEUE_MAX_RETRY_ATTEMPTS`, `NS_SMTP_FROM_ADDRESS` and
+`NS_AUTH_ENABLED`.
 
 ## License
 

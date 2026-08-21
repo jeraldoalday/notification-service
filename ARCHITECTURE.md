@@ -24,8 +24,9 @@ so each concern can be tested and evolved independently:
   keys at runtime. Deliberately takes an injectable map rather than reading
   `std::env` directly wherever overrides are applied, so the override logic
   is unit-testable without mutating global process state.
-- **`ns-storage`** -- `NotificationRepository`, `RecipientRepository` and
-  `TemplateRepository` traits with a SQLite implementation (via `sqlx`). Each entity is stored
+- **`ns-storage`** -- `NotificationRepository`, `RecipientRepository`,
+  `TemplateRepository` and `ApiKeyRepository` traits with a SQLite
+  implementation (via `sqlx`). Each entity is stored
   as a full JSON document in a `data` column, alongside a handful of plain
   columns (`status`, `priority`, `scheduled_for`, `tenant_id`) that exist
   purely to make filtered queries efficient -- `due_for_delivery`, the
@@ -36,7 +37,11 @@ so each concern can be tested and evolved independently:
   pattern but are keyed by the `(tenant_id, id)` pair rather than a
   surrogate id, since a template id is a caller-chosen slug that only has
   to be unique within a tenant -- which also lets that primary key index
-  serve the per-tenant listing.
+  serve the per-tenant listing. API keys are keyed by id but looked up by
+  token digest, since a caller presents only a token: the digest column is
+  `UNIQUE`, which makes that lookup a point query rather than a scan over
+  every key ever issued, and makes a duplicate digest fail at the insert
+  instead of silently resolving to whichever row came first.
 - **`ns-queue`** -- durable job queue built on top of `ns-storage`'s
   repositories. Priority ordering and delayed/scheduled delivery are
   already handled by `due_for_delivery`, so `NotificationQueue` is
@@ -86,7 +91,14 @@ so each concern can be tested and evolved independently:
   up front, for the same reason the recipient is checked up front -- a
   notification that can never be delivered should be refused while the
   caller is still on the line, not discovered by the worker several
-  backoff delays later.
+  backoff delays later. A `route_layer` resolves the request's credential
+  into a `Caller` before any handler runs, and each handler asks that
+  `Caller` for the scope it needs and the tenant it should act for --
+  which keeps the check next to the work it guards, so a handler that
+  forgets one is visible in the handler rather than in a table elsewhere.
+  It's a `route_layer` rather than a `layer` so an unknown path answers
+  404 instead of 401, which would otherwise turn the auth layer into a
+  directory of which routes exist.
 - **`ns-worker`** -- dequeues due notifications via `ns-queue::claim_batch`
   and dispatches each to the `ns-channels` implementation matching its
   `ChannelKind`, looked up through a `ChannelRegistry` built at startup from
@@ -123,15 +135,80 @@ so each concern can be tested and evolved independently:
   mistakes cost nothing at delivery time, and rendered at *send* time
   rather than submit time, so editing a template also fixes the wording
   of everything still queued behind it.
+- **`ns-metrics`** -- counters, gauges and latency histograms, plus a
+  Prometheus text-exposition renderer. Self-contained rather than a
+  metrics facade with a separate recorder and exporter: the service needs
+  a couple of dozen series and one `/metrics` endpoint, and owning it
+  outright keeps the naming conventions, the label vocabulary and the
+  exposition format under one crate's tests. Instruments are relaxed
+  atomics handed out as `Arc` handles, so a caller resolves a series once
+  at startup and the registry's lock is only taken when a series is first
+  created and while a scrape walks the families -- never on the delivery
+  path. Every series a closed enum can produce (`ChannelKind` x outcome,
+  `DeliveryStatus`) is created up front, so a channel with no traffic
+  exports an explicit `0` instead of a gap a dashboard has to interpret.
+  Queue depth is the exception to "record as it happens": it's recomputed
+  from a `GROUP BY` at scrape time, because a gauge maintained by
+  increment/decrement drifts permanently out of true the first time a
+  process dies mid-transition, and the worker isn't the only writer.
+- **`ns-auth`** -- API keys, scopes and the tenant identity a request acts
+  under. A caller presents a bearer token; the service resolves it to an
+  `AuthContext` carrying that key's tenant and scopes, and every handler
+  works from the context rather than from anything the request said about
+  itself. That is the distinction the crate exists to enforce: the way a
+  multi-tenant service usually fails is by authenticating the caller
+  correctly and then trusting the caller's own claim about which tenant it
+  is acting for. Tokens are 256 bits from the system CSPRNG, stored as
+  SHA-256 digests and compared in constant time -- a password hash would
+  be the wrong tool, since bcrypt and argon2 exist to make *guessing*
+  expensive and there is nothing here to guess, while their per-check cost
+  would be paid on every authenticated request. Scopes are three coarse
+  levels ordered by blast radius (`read` observes, `write` causes messages
+  to be sent, `admin` mints further credentials), with `write` implying
+  `read` and `admin` implying both, because a permission model finer than
+  the surface it protects mostly produces scope lists nobody reads.
 - **`ns-cli`** -- the `ns` admin binary: register recipients, submit test
   notifications, inspect and replay the queue, manage templates. It
   reaches the database directly rather than going through the HTTP API,
   because it's a tool for the host the service runs on and needs to work
-  when the API is exactly what's broken. Command implementations live in
+  when the API is exactly what's broken. That's also why API-key
+  management lives here as well as behind the admin-scoped endpoints: a
+  deployment's first key has to come from somewhere, and an API usable
+  only by someone who already holds a key can't issue one. Command implementations live in
   the library and return the text to print, so `main` owns all the I/O
   and each command is testable against a temporary database; both output
   formats (human-readable text, JSON for scripts) come off the same code
   path.
+
+## Tenancy
+
+Every entity the service stores is owned by exactly one tenant:
+notifications and templates were tenant-keyed from the start, and
+recipients gained a tenant alongside authentication. An API key belongs to
+one tenant, and that -- not anything in the request -- decides which
+tenant a request acts for. A `tenant_id` supplied in a body or query
+string is accepted only when it agrees with the key, and refused with a
+403 when it doesn't, rather than being quietly overridden: a client
+sending the wrong tenant should find out rather than silently write
+somewhere unexpected.
+
+Lookups by id are the exception to that 403. Asking for a notification,
+recipient or key belonging to another tenant answers 404, because a 403
+would confirm the id names something real -- and unlike an explicit
+`tenant_id` (where the 403 tells a misconfigured client something useful
+about its own request), an opaque id belonging to someone else is
+indistinguishable, from the caller's side, from an id belonging to nobody.
+
+Two boundaries sit deliberately outside this. `/health` and `/metrics`
+need no credential: a liveness probe that requires one reports the service
+as down whenever the credential is what's wrong, and a scrape endpoint
+behind a bearer token is one most Prometheus deployments won't be pointed
+at. Neither exposes tenant data -- no metric carries a tenant label,
+partly for exactly this reason. And `auth.enabled = false` turns the whole
+mechanism off for a single-tenant deployment whose network already decides
+who can reach it; the serve binary warns loudly at startup when it does,
+because an open notification sender should be a choice someone made rather
+than something they discover later.
 
 ## Delivery lifecycle
 
@@ -171,5 +248,7 @@ This file is updated as each part lands. Currently implemented:
 - [x] HTTP API (`ns-api`): recipients, submit/get/list/cancel notifications
 - [x] Notification templates (`ns-templates`): storage, rendering, API, CLI
 - [x] Admin CLI (`ns-cli`)
-- [ ] Observability (metrics, tracing)
-- [ ] Auth & multi-tenancy
+- [x] Observability (`ns-metrics`: instruments, Prometheus `/metrics`,
+      worker and HTTP instrumentation)
+- [x] Auth & multi-tenancy (`ns-auth`: API keys, scopes, per-tenant
+      isolation across notifications, templates and recipients)
