@@ -15,6 +15,9 @@
 
 pub mod instrument;
 pub mod labels;
+pub mod prometheus;
+pub mod registry;
 
 pub use instrument::{Counter, Gauge, Histogram, DEFAULT_LATENCY_BUCKETS};
 pub use labels::{label, Labels};
+pub use registry::{Family, MetricKind, Registry, Series};
