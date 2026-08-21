@@ -1444,6 +1444,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "clap",
+ "ns-auth",
  "ns-config",
  "ns-core",
  "ns-queue",

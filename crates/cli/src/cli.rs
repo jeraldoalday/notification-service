@@ -48,6 +48,44 @@ pub enum Command {
     /// Inspect and operate on the delivery queue.
     #[command(subcommand)]
     Queue(QueueCommand),
+
+    /// Mint, list and revoke the API keys the HTTP API authenticates.
+    ///
+    /// This lives in the CLI rather than only behind an admin-scoped
+    /// endpoint because a deployment's *first* key has to come from
+    /// somewhere, and an API that can only be used by someone who already
+    /// holds a key has no way to issue one.
+    #[command(subcommand)]
+    Apikey(ApikeyCommand),
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ApikeyCommand {
+    /// Mint a key. Its token is printed once and cannot be recovered.
+    Create {
+        #[arg(long)]
+        tenant: Uuid,
+
+        /// A label to recognise this key by later, e.g. ci-deploy.
+        #[arg(long)]
+        name: String,
+
+        /// A scope to grant. Repeat for each one: read, write, admin.
+        #[arg(long = "scope", value_parser = parse::scope)]
+        scopes: Vec<ns_auth::Scope>,
+    },
+
+    /// List a tenant's keys, newest first, including revoked ones.
+    List {
+        #[arg(long)]
+        tenant: Uuid,
+
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+    },
+
+    /// Revoke a key, so it stops authenticating immediately.
+    Revoke { id: Uuid },
 }
 
 #[derive(Debug, Subcommand)]

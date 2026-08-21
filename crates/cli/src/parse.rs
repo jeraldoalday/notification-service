@@ -23,6 +23,13 @@ pub fn status(raw: &str) -> Result<DeliveryStatus, String> {
     parse_enum(raw, &DeliveryStatus::all().map(|s| s.as_str()))
 }
 
+/// Parses a `--scope` value. `ns-auth::Scope` already has a `FromStr`
+/// whose error names the accepted values, so this just forwards to it
+/// rather than restating the list in a second place.
+pub fn scope(raw: &str) -> Result<ns_auth::Scope, String> {
+    raw.parse()
+}
+
 pub fn priority(raw: &str) -> Result<Priority, String> {
     parse_enum(raw, &["low", "normal", "high", "critical"])
 }
@@ -43,6 +50,14 @@ pub fn key_value(raw: &str) -> Result<(String, String), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_every_scope_auth_defines() {
+        for value in ns_auth::Scope::all() {
+            assert_eq!(scope(value.as_str()).unwrap(), value);
+        }
+        assert!(scope("superuser").unwrap_err().contains("read, write, admin"));
+    }
 
     #[test]
     fn parses_every_channel_the_domain_defines() {

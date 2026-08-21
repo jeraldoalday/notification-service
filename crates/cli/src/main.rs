@@ -1,6 +1,6 @@
 use clap::Parser;
+use ns_cli::cli::{ApikeyCommand, QueueCommand, RecipientCommand, TemplateCommand, TemplateSaveArgs};
 use ns_cli::cli::{Cli, Command, NotificationCommand, SubmitArgs};
-use ns_cli::cli::{QueueCommand, RecipientCommand, TemplateCommand, TemplateSaveArgs};
 use ns_cli::commands;
 use ns_cli::commands::notification::parse_timestamp;
 use ns_cli::error::CliResult;
@@ -86,6 +86,15 @@ async fn run() -> CliResult<()> {
         }
         Command::Queue(QueueCommand::Replay { tenant, limit }) => {
             commands::queue::replay(&storage, tenant, limit, cli.output).await?
+        }
+        Command::Apikey(ApikeyCommand::Create { tenant, name, scopes }) => {
+            commands::apikey::create(&storage, tenant, name, scopes, cli.output).await?
+        }
+        Command::Apikey(ApikeyCommand::List { tenant, limit }) => {
+            commands::apikey::list(&storage, tenant, limit, cli.output).await?
+        }
+        Command::Apikey(ApikeyCommand::Revoke { id }) => {
+            commands::apikey::revoke(&storage, id, cli.output).await?
         }
     };
 
