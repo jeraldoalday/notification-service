@@ -1523,6 +1523,7 @@ dependencies = [
  "chrono",
  "ns-channels",
  "ns-core",
+ "ns-metrics",
  "ns-queue",
  "ns-storage",
  "ns-templates",

@@ -12,6 +12,7 @@ ns-storage = { path = "../storage" }
 ns-queue = { path = "../queue" }
 ns-channels = { path = "../channels" }
 ns-templates = { path = "../templates" }
+ns-metrics = { path = "../metrics" }
 chrono.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true

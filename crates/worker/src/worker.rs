@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
 use ns_core::{DeliveryStatus, Notification};
+use ns_metrics::{AttemptOutcome, ServiceMetrics, SkipReason};
 use ns_queue::NotificationQueue;
 use ns_storage::{NotificationRepository, RecipientRepository, TemplateRepository};
 use tracing::{info, warn};
@@ -40,6 +41,21 @@ fn outcome_from_status(status: DeliveryStatus) -> DispatchOutcome {
     }
 }
 
+impl DispatchOutcome {
+    /// The metrics-layer spelling of this outcome. `ns-metrics` keeps its
+    /// own enum rather than importing this one, so that a crate needing
+    /// only a four-variant label doesn't have to depend on the worker's
+    /// storage, channel and runtime dependencies.
+    fn as_metric(&self) -> AttemptOutcome {
+        match self {
+            DispatchOutcome::Delivered => AttemptOutcome::Delivered,
+            DispatchOutcome::Failed => AttemptOutcome::Failed,
+            DispatchOutcome::Deferred => AttemptOutcome::Deferred,
+            DispatchOutcome::DeadLettered => AttemptOutcome::DeadLettered,
+        }
+    }
+}
+
 /// Polls `ns-queue` for due notifications and dispatches each to the
 /// `ns-channels` implementation matching its `ChannelKind`, reporting the
 /// outcome back to the queue -- which owns all retry/backoff/dead-letter
@@ -56,6 +72,10 @@ pub struct Worker<R> {
     /// deployment that doesn't use templates -- and every existing
     /// caller of `Worker::new` -- is unaffected.
     templates: Option<Arc<dyn TemplateRepository>>,
+    /// Optional for the same reason: a `Worker` with no metrics handle
+    /// records nothing and behaves identically, so embedding one in a test
+    /// (or in a deployment that doesn't scrape) needs no extra wiring.
+    metrics: Option<Arc<ServiceMetrics>>,
 }
 
 impl<R: NotificationRepository + RecipientRepository + Clone> Worker<R> {
@@ -72,6 +92,7 @@ impl<R: NotificationRepository + RecipientRepository + Clone> Worker<R> {
             rate_limiter,
             circuit_breaker,
             templates: None,
+            metrics: None,
         }
     }
 
@@ -82,6 +103,20 @@ impl<R: NotificationRepository + RecipientRepository + Clone> Worker<R> {
     pub fn with_templates(mut self, templates: Arc<dyn TemplateRepository>) -> Self {
         self.templates = Some(templates);
         self
+    }
+
+    /// Gives this worker somewhere to report what it did. Shared as an
+    /// `Arc` so a process running the worker and the HTTP API together
+    /// exports one set of counters covering both.
+    pub fn with_metrics(mut self, metrics: Arc<ServiceMetrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
+    }
+
+    fn record_skip(&self, notification: &Notification, reason: SkipReason) {
+        if let Some(metrics) = &self.metrics {
+            metrics.record_skip(notification.channel, reason);
+        }
     }
 
     /// Replaces a templated notification's subject/body with the rendered
@@ -145,11 +180,13 @@ impl<R: NotificationRepository + RecipientRepository + Clone> Worker<R> {
         // natural delay for an open breaker -- the notification comes back
         // around about when the breaker is ready to trial one.
         if !self.circuit_breaker.allow(notification.channel, now) {
+            self.record_skip(&notification, SkipReason::CircuitOpen);
             self.queue.defer(notification, self.circuit_breaker.cooldown(), now).await?;
             return Ok(DispatchOutcome::Deferred);
         }
 
         if !self.rate_limiter.try_acquire(notification.channel, now) {
+            self.record_skip(&notification, SkipReason::RateLimited);
             self.queue.defer(notification, RATE_LIMIT_DEFER, now).await?;
             return Ok(DispatchOutcome::Deferred);
         }
@@ -178,7 +215,18 @@ impl<R: NotificationRepository + RecipientRepository + Clone> Worker<R> {
             }
         };
 
-        match channel.send(&notification, address).await {
+        // Timed around the provider call only, so the histogram measures
+        // the provider rather than this worker's own bookkeeping -- and
+        // timed only here, because a send a guard refused never happened
+        // and reporting microseconds of doing nothing as provider latency
+        // would drag every percentile down.
+        let started = std::time::Instant::now();
+        let result = channel.send(&notification, address).await;
+        if let Some(metrics) = &self.metrics {
+            metrics.observe_send_duration(notification.channel, started.elapsed().as_secs_f64());
+        }
+
+        match result {
             Ok(()) => {
                 self.circuit_breaker.record_success(notification.channel);
                 self.queue.complete(notification, now).await?;
@@ -202,8 +250,16 @@ impl<R: NotificationRepository + RecipientRepository + Clone> Worker<R> {
         let claimed = self.queue.claim_batch(now, batch_size).await?;
         let mut outcomes = Vec::with_capacity(claimed.len());
 
+        if let Some(metrics) = &self.metrics {
+            metrics.record_poll(claimed.len());
+        }
+
         for notification in claimed {
+            let channel = notification.channel;
             let outcome = self.dispatch_one(notification.clone(), Utc::now()).await?;
+            if let Some(metrics) = &self.metrics {
+                metrics.record_attempt(channel, outcome.as_metric());
+            }
             outcomes.push((notification, outcome));
         }
 
@@ -753,5 +809,129 @@ mod tests {
 
         let stored = repo.get_notification(submitted.id).await.unwrap();
         assert_eq!(stored.attempt_count, 1, "deferral must not have softened ordinary failures");
+    }
+
+    #[tokio::test]
+    async fn a_delivered_notification_is_counted_and_timed() {
+        let (repo, _dir) = test_repo().await;
+        let recipient_id = seed_recipient(&repo, ChannelKind::Webhook).await;
+        seed_notification(&repo, recipient_id, 3).await;
+
+        let metrics = Arc::new(ServiceMetrics::new());
+        let registry =
+            ChannelRegistry::new().register(ChannelKind::Webhook, Arc::new(FakeChannel::succeeding()));
+        let worker = Worker::new(repo.clone(), registry, RateLimiter::new(), CircuitBreaker::disabled())
+            .with_metrics(Arc::clone(&metrics));
+
+        worker.run_once(10).await.unwrap();
+
+        let text = metrics.render();
+        assert!(
+            text.contains("ns_notification_attempts_total{channel=\"webhook\",outcome=\"delivered\"} 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("ns_notification_send_duration_seconds_count{channel=\"webhook\"} 1"),
+            "{text}"
+        );
+        assert!(text.contains("ns_worker_polls_total 1"), "{text}");
+        assert!(text.contains("ns_worker_claimed_total 1"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_failed_send_is_counted_as_failed_and_still_timed() {
+        let (repo, _dir) = test_repo().await;
+        let recipient_id = seed_recipient(&repo, ChannelKind::Webhook).await;
+        seed_notification(&repo, recipient_id, 3).await;
+
+        let metrics = Arc::new(ServiceMetrics::new());
+        let registry =
+            ChannelRegistry::new().register(ChannelKind::Webhook, Arc::new(FakeChannel::failing()));
+        let worker = Worker::new(repo.clone(), registry, RateLimiter::new(), CircuitBreaker::disabled())
+            .with_metrics(Arc::clone(&metrics));
+
+        worker.run_once(10).await.unwrap();
+
+        let text = metrics.render();
+        assert!(
+            text.contains("ns_notification_attempts_total{channel=\"webhook\",outcome=\"failed\"} 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("ns_notification_send_duration_seconds_count{channel=\"webhook\"} 1"),
+            "a send that reached the provider is timed whether or not it succeeded: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_guarded_dispatch_records_its_reason_and_no_send_duration() {
+        let (repo, _dir) = test_repo().await;
+        let recipient_id = seed_recipient(&repo, ChannelKind::Webhook).await;
+        seed_notification(&repo, recipient_id, 3).await;
+
+        let metrics = Arc::new(ServiceMetrics::new());
+        let registry =
+            ChannelRegistry::new().register(ChannelKind::Webhook, Arc::new(FakeChannel::succeeding()));
+        let limiter = RateLimiter::new().with_limit(ChannelKind::Webhook, 0, 0.0);
+        let worker = Worker::new(repo.clone(), registry, limiter, CircuitBreaker::disabled())
+            .with_metrics(Arc::clone(&metrics));
+
+        worker.run_once(10).await.unwrap();
+
+        let text = metrics.render();
+        assert!(
+            text.contains("ns_notification_skipped_total{channel=\"webhook\",reason=\"rate_limited\"} 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("ns_notification_attempts_total{channel=\"webhook\",outcome=\"deferred\"} 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("ns_notification_send_duration_seconds_count{channel=\"webhook\"} 0"),
+            "a send that never happened must not land in the provider latency histogram: {text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_open_breaker_is_a_distinct_skip_reason() {
+        let (repo, _dir) = test_repo().await;
+        let recipient_id = seed_recipient(&repo, ChannelKind::Webhook).await;
+        seed_notification(&repo, recipient_id, 3).await;
+
+        let metrics = Arc::new(ServiceMetrics::new());
+        let registry =
+            ChannelRegistry::new().register(ChannelKind::Webhook, Arc::new(FakeChannel::succeeding()));
+        let breaker = CircuitBreaker::new(1, Duration::seconds(60));
+        breaker.record_failure(ChannelKind::Webhook, Utc::now());
+        let worker = Worker::new(repo.clone(), registry, RateLimiter::new(), breaker)
+            .with_metrics(Arc::clone(&metrics));
+
+        worker.run_once(10).await.unwrap();
+
+        let text = metrics.render();
+        assert!(
+            text.contains("ns_notification_skipped_total{channel=\"webhook\",reason=\"circuit_open\"} 1"),
+            "{text}"
+        );
+        assert!(
+            text.contains("ns_notification_skipped_total{channel=\"webhook\",reason=\"rate_limited\"} 0"),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_idle_poll_is_still_counted() {
+        let (repo, _dir) = test_repo().await;
+        let metrics = Arc::new(ServiceMetrics::new());
+        let worker =
+            Worker::new(repo, ChannelRegistry::new(), RateLimiter::new(), CircuitBreaker::disabled())
+                .with_metrics(Arc::clone(&metrics));
+
+        worker.run_once(10).await.unwrap();
+
+        let text = metrics.render();
+        assert!(text.contains("ns_worker_polls_total 1"), "{text}");
+        assert!(text.contains("ns_worker_claimed_total 0"), "{text}");
     }
 }
