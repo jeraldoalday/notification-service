@@ -1,0 +1,9 @@
+[package]
+name = "ns-metrics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "In-process metric instruments and a Prometheus text exposition renderer"
+
+[dependencies]

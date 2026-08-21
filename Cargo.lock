@@ -1463,6 +1463,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "ns-metrics"
+version = "0.1.0"
+
+[[package]]
 name = "ns-queue"
 version = "0.1.0"
 dependencies = [
