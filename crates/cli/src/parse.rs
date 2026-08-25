@@ -30,6 +30,12 @@ pub fn scope(raw: &str) -> Result<ns_auth::Scope, String> {
     raw.parse()
 }
 
+/// Parses a `--reason` value. Forwards to the domain's own `FromStr`,
+/// whose error already names the accepted values.
+pub fn suppression_reason(raw: &str) -> Result<ns_core::SuppressionReason, String> {
+    raw.parse().map_err(|err: ns_core::CoreError| err.to_string())
+}
+
 pub fn priority(raw: &str) -> Result<Priority, String> {
     parse_enum(raw, &["low", "normal", "high", "critical"])
 }
@@ -71,6 +77,14 @@ mod tests {
         for value in DeliveryStatus::all() {
             assert_eq!(status(value.as_str()).unwrap(), value);
         }
+    }
+
+    #[test]
+    fn parses_every_suppression_reason_the_domain_defines() {
+        for value in ns_core::SuppressionReason::all() {
+            assert_eq!(suppression_reason(value.as_str()).unwrap(), value);
+        }
+        assert!(suppression_reason("annoyed").is_err());
     }
 
     #[test]

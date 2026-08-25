@@ -1,5 +1,7 @@
 use clap::Parser;
-use ns_cli::cli::{ApikeyCommand, QueueCommand, RecipientCommand, TemplateCommand, TemplateSaveArgs};
+use ns_cli::cli::{
+    ApikeyCommand, QueueCommand, RecipientCommand, SuppressionCommand, TemplateCommand, TemplateSaveArgs,
+};
 use ns_cli::cli::{Cli, Command, NotificationCommand, SubmitArgs};
 use ns_cli::commands;
 use ns_cli::commands::notification::parse_timestamp;
@@ -92,6 +94,18 @@ async fn run() -> CliResult<()> {
         }
         Command::Queue(QueueCommand::PurgeAttempts { older_than_days }) => {
             commands::queue::purge_attempts(&storage, older_than_days, cli.output).await?
+        }
+        Command::Suppression(SuppressionCommand::Add { tenant, channel, address, reason, note }) => {
+            commands::suppression::add(&storage, tenant, channel, address, reason, note, cli.output).await?
+        }
+        Command::Suppression(SuppressionCommand::List { tenant, limit }) => {
+            commands::suppression::list(&storage, tenant, limit, cli.output).await?
+        }
+        Command::Suppression(SuppressionCommand::Check { tenant, channel, address }) => {
+            commands::suppression::check(&storage, tenant, channel, address, cli.output).await?
+        }
+        Command::Suppression(SuppressionCommand::Remove { tenant, channel, address }) => {
+            commands::suppression::remove(&storage, tenant, channel, address, cli.output).await?
         }
         Command::Apikey(ApikeyCommand::Create { tenant, name, scopes }) => {
             commands::apikey::create(&storage, tenant, name, scopes, cli.output).await?

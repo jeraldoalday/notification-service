@@ -49,6 +49,10 @@ pub enum Command {
     #[command(subcommand)]
     Queue(QueueCommand),
 
+    /// Manage the addresses a tenant may no longer send to.
+    #[command(subcommand)]
+    Suppression(SuppressionCommand),
+
     /// Mint, list and revoke the API keys the HTTP API authenticates.
     ///
     /// This lives in the CLI rather than only behind an admin-scoped
@@ -86,6 +90,65 @@ pub enum ApikeyCommand {
 
     /// Revoke a key, so it stops authenticating immediately.
     Revoke { id: Uuid },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SuppressionCommand {
+    /// Suppress an address. Re-running updates the reason rather than
+    /// failing, so working through a list of bounces is idempotent.
+    Add {
+        #[arg(long)]
+        tenant: Uuid,
+
+        #[arg(long, value_parser = parse::channel)]
+        channel: ChannelKind,
+
+        /// The address itself: an email, an E.164 number, a push token or
+        /// a webhook URL, matching --channel.
+        address: String,
+
+        #[arg(long, value_parser = parse::suppression_reason, default_value = "manual")]
+        reason: ns_core::SuppressionReason,
+
+        /// Free text to remember why -- a bounce code, a ticket id.
+        #[arg(long)]
+        note: Option<String>,
+    },
+
+    /// List a tenant's suppressed addresses, newest first.
+    List {
+        #[arg(long)]
+        tenant: Uuid,
+
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+    },
+
+    /// Ask whether one address is suppressed.
+    Check {
+        #[arg(long)]
+        tenant: Uuid,
+
+        #[arg(long, value_parser = parse::channel)]
+        channel: ChannelKind,
+
+        address: String,
+    },
+
+    /// Lift a suppression, so the address can be sent to again.
+    ///
+    /// Unlike `add`, an address that wasn't suppressed is an error: this
+    /// re-enables sending to someone who asked not to be sent to, so a
+    /// typo should not look like a success.
+    Remove {
+        #[arg(long)]
+        tenant: Uuid,
+
+        #[arg(long, value_parser = parse::channel)]
+        channel: ChannelKind,
+
+        address: String,
+    },
 }
 
 #[derive(Debug, Subcommand)]
