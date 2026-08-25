@@ -5,7 +5,8 @@ use ns_core::{AttemptResult, DeliveryAttempt, DeliveryStatus, Notification};
 use ns_metrics::{AttemptOutcome, ServiceMetrics, SkipReason};
 use ns_queue::NotificationQueue;
 use ns_storage::{
-    DeliveryAttemptRepository, NotificationRepository, RecipientRepository, TemplateRepository,
+    DeliveryAttemptRepository, NotificationRepository, RecipientRepository, SuppressionRepository,
+    TemplateRepository,
 };
 use tracing::{info, warn};
 
@@ -34,6 +35,9 @@ pub enum DispatchOutcome {
     /// The send failed and no attempts remained, so the notification was
     /// dead-lettered.
     DeadLettered,
+    /// The recipient's address is on the tenant's suppression list, so
+    /// nothing was sent and the notification is terminally suppressed.
+    Suppressed,
 }
 
 fn outcome_from_status(status: DeliveryStatus) -> DispatchOutcome {
@@ -54,6 +58,7 @@ impl DispatchOutcome {
             DispatchOutcome::Failed => AttemptOutcome::Failed,
             DispatchOutcome::Deferred => AttemptOutcome::Deferred,
             DispatchOutcome::DeadLettered => AttemptOutcome::DeadLettered,
+            DispatchOutcome::Suppressed => AttemptOutcome::Suppressed,
         }
     }
 }
@@ -85,7 +90,15 @@ pub struct Worker<R> {
     attempts: Option<Arc<dyn DeliveryAttemptRepository>>,
 }
 
-impl<R: NotificationRepository + RecipientRepository + Clone> Worker<R> {
+// SuppressionRepository is a bound on `R` rather than another optional
+// handle like `templates` or `metrics`, and the difference is deliberate.
+// A worker missing its template store fails the notifications that need
+// one, loudly; a worker missing its metrics handle records nothing and
+// costs nobody anything. A worker missing its suppression list would
+// silently send to every address that ever asked not to be contacted --
+// the one failure mode here that is worse than not running at all. Making
+// it a bound means a deployment cannot forget to wire it.
+impl<R: NotificationRepository + RecipientRepository + SuppressionRepository + Clone> Worker<R> {
     pub fn new(
         repo: R,
         channels: ChannelRegistry,
@@ -192,9 +205,12 @@ impl<R: NotificationRepository + RecipientRepository + Clone> Worker<R> {
     }
 
     /// Dispatches a single already-claimed (`Sending`) notification: checks
-    /// the circuit breaker and rate limiter, looks up the registered
-    /// channel and the recipient's address for it, sends, and reports the
-    /// outcome back to the queue and the circuit breaker. Every
+    /// in two phases. First, whether it should be sent at all: it renders,
+    /// resolves the channel and the recipient's address, and checks that
+    /// address against the tenant's suppression list. Then, whether it can
+    /// be sent now: the circuit breaker and the rate limiter. Only then
+    /// does it send and report the outcome back to the queue and the
+    /// circuit breaker. Every
     /// business-level failure (breaker open, rate limited, unregistered
     /// channel, missing address, provider rejection/transport error) is
     /// routed through `NotificationQueue::fail` so it gets the same
@@ -223,29 +239,6 @@ impl<R: NotificationRepository + RecipientRepository + Clone> Worker<R> {
             self.log_skip(&notification, err.to_string(), now).await;
             let failed = self.queue.fail(notification, now).await?;
             return Ok(outcome_from_status(failed.status));
-        }
-
-        // A guard declining a send is not a failed delivery: nothing
-        // reached a provider, so spending one of the notification's
-        // attempts on it would let a provider outage or a sustained burst
-        // dead-letter work that was never actually tried. Both guards
-        // therefore defer rather than fail. The breaker's cooldown is the
-        // natural delay for an open breaker -- the notification comes back
-        // around about when the breaker is ready to trial one.
-        if !self.circuit_breaker.allow(notification.channel, now) {
-            self.record_skip(&notification, SkipReason::CircuitOpen);
-            self.log_skip(&notification, format!("circuit breaker open for {}", notification.channel), now)
-                .await;
-            self.queue.defer(notification, self.circuit_breaker.cooldown(), now).await?;
-            return Ok(DispatchOutcome::Deferred);
-        }
-
-        if !self.rate_limiter.try_acquire(notification.channel, now) {
-            self.record_skip(&notification, SkipReason::RateLimited);
-            self.log_skip(&notification, format!("rate limit exhausted for {}", notification.channel), now)
-                .await;
-            self.queue.defer(notification, RATE_LIMIT_DEFER, now).await?;
-            return Ok(DispatchOutcome::Deferred);
         }
 
         let Some(channel) = self.channels.get(notification.channel) else {
@@ -279,6 +272,52 @@ impl<R: NotificationRepository + RecipientRepository + Clone> Worker<R> {
                 return Ok(outcome_from_status(failed.status));
             }
         };
+
+        // The last of the "should this be sent at all" checks, and the
+        // first moment the service knows which address this notification
+        // would actually reach -- a notification names a recipient and a
+        // channel, and the address only falls out of resolving both.
+        if let Some(suppression) = self.repo.find_suppression(notification.tenant_id, address).await? {
+            info!(
+                notification_id = %notification.id,
+                reason = %suppression.reason,
+                "address is suppressed, not sending"
+            );
+            self.log_skip(&notification, format!("address is suppressed ({})", suppression.reason), now)
+                .await;
+            self.queue.suppress(notification, now).await?;
+            return Ok(DispatchOutcome::Suppressed);
+        }
+
+        // Everything above decided whether this should be sent; the two
+        // guards below decide whether it can be sent *now*. Running them
+        // in that order means a notification that will never go out --
+        // unrenderable, unaddressable, suppressed -- doesn't consume one
+        // of the channel's rate-limit tokens or sit behind an open breaker
+        // waiting to discover that.
+        //
+        // A guard declining a send is not a failed delivery: nothing
+        // reached a provider, so spending one of the notification's
+        // attempts on it would let a provider outage or a sustained burst
+        // dead-letter work that was never actually tried. Both guards
+        // therefore defer rather than fail. The breaker's cooldown is the
+        // natural delay for an open breaker -- the notification comes back
+        // around about when the breaker is ready to trial one.
+        if !self.circuit_breaker.allow(notification.channel, now) {
+            self.record_skip(&notification, SkipReason::CircuitOpen);
+            self.log_skip(&notification, format!("circuit breaker open for {}", notification.channel), now)
+                .await;
+            self.queue.defer(notification, self.circuit_breaker.cooldown(), now).await?;
+            return Ok(DispatchOutcome::Deferred);
+        }
+
+        if !self.rate_limiter.try_acquire(notification.channel, now) {
+            self.record_skip(&notification, SkipReason::RateLimited);
+            self.log_skip(&notification, format!("rate limit exhausted for {}", notification.channel), now)
+                .await;
+            self.queue.defer(notification, RATE_LIMIT_DEFER, now).await?;
+            return Ok(DispatchOutcome::Deferred);
+        }
 
         // Timed around the provider call only, so the histogram measures
         // the provider rather than this worker's own bookkeeping -- and
@@ -453,6 +492,167 @@ mod tests {
             .build()
             .unwrap();
         queue.submit(notification, Utc::now()).await.unwrap()
+    }
+
+    // -- suppression ---------------------------------------------------
+
+    async fn suppress_address(repo: &SqliteStorage, tenant_id: Uuid, address: RecipientAddress) {
+        use ns_core::{Suppression, SuppressionReason};
+        let entry =
+            Suppression::new(tenant_id, address, SuppressionReason::Unsubscribed, Utc::now()).unwrap();
+        ns_storage::SuppressionRepository::insert_suppression(repo, &entry).await.unwrap();
+    }
+
+    /// A recipient plus a queued notification for it, sharing one tenant,
+    /// so a suppression added for that tenant actually covers the send.
+    async fn seed_for_suppression(repo: &SqliteStorage) -> (Uuid, Notification, RecipientAddress) {
+        let tenant_id = Uuid::new_v4();
+        let address = RecipientAddress::WebhookUrl("https://example.com/hook".into());
+        let recipient = Recipient::new(Uuid::new_v4(), tenant_id).with_address(address.clone()).unwrap();
+        repo.insert_recipient(&recipient).await.unwrap();
+
+        let queue = NotificationQueue::new(repo.clone());
+        let notification = Notification::builder(tenant_id, recipient.id, ChannelKind::Webhook)
+            .body("hello")
+            .max_attempts(3)
+            .build()
+            .unwrap();
+        let submitted = queue.submit(notification, Utc::now()).await.unwrap();
+        (tenant_id, submitted, address)
+    }
+
+    #[tokio::test]
+    async fn a_suppressed_address_is_never_sent_to() {
+        let (repo, _dir) = test_repo().await;
+        let (tenant_id, submitted, address) = seed_for_suppression(&repo).await;
+        suppress_address(&repo, tenant_id, address).await;
+
+        let channel = Arc::new(FakeChannel::succeeding());
+        let registry = ChannelRegistry::new().register(ChannelKind::Webhook, Arc::clone(&channel) as _);
+        let worker = Worker::new(repo.clone(), registry, RateLimiter::new(), CircuitBreaker::disabled());
+
+        let outcomes = worker.run_once(10).await.unwrap();
+
+        assert_eq!(outcomes[0].1, DispatchOutcome::Suppressed);
+        assert_eq!(channel.calls.load(Ordering::SeqCst), 0, "the provider was never contacted");
+        let stored = repo.get_notification(submitted.id).await.unwrap();
+        assert_eq!(stored.status, DeliveryStatus::Suppressed);
+    }
+
+    #[tokio::test]
+    async fn suppression_spends_no_attempt_and_never_comes_back() {
+        let (repo, _dir) = test_repo().await;
+        let (tenant_id, submitted, address) = seed_for_suppression(&repo).await;
+        suppress_address(&repo, tenant_id, address).await;
+
+        let registry =
+            ChannelRegistry::new().register(ChannelKind::Webhook, Arc::new(FakeChannel::succeeding()));
+        let worker = Worker::new(repo.clone(), registry, RateLimiter::new(), CircuitBreaker::disabled());
+        worker.run_once(10).await.unwrap();
+
+        let stored = repo.get_notification(submitted.id).await.unwrap();
+        assert_eq!(stored.attempt_count, 0);
+        assert!(worker.run_once(10).await.unwrap().is_empty(), "and it is not claimable again");
+    }
+
+    #[tokio::test]
+    async fn another_tenants_suppression_does_not_apply() {
+        let (repo, _dir) = test_repo().await;
+        let (_tenant_id, submitted, address) = seed_for_suppression(&repo).await;
+        suppress_address(&repo, Uuid::new_v4(), address).await;
+
+        let registry =
+            ChannelRegistry::new().register(ChannelKind::Webhook, Arc::new(FakeChannel::succeeding()));
+        let worker = Worker::new(repo.clone(), registry, RateLimiter::new(), CircuitBreaker::disabled());
+        worker.run_once(10).await.unwrap();
+
+        assert_eq!(
+            repo.get_notification(submitted.id).await.unwrap().status,
+            DeliveryStatus::Delivered,
+            "suppression lists are per-tenant"
+        );
+    }
+
+    #[tokio::test]
+    async fn suppression_on_another_channel_does_not_apply() {
+        let (repo, _dir) = test_repo().await;
+        let (tenant_id, submitted, _address) = seed_for_suppression(&repo).await;
+        // Same tenant, same person, different channel: unsubscribing from
+        // email says nothing about the webhook.
+        suppress_address(&repo, tenant_id, RecipientAddress::Email("ada@example.com".into())).await;
+
+        let registry =
+            ChannelRegistry::new().register(ChannelKind::Webhook, Arc::new(FakeChannel::succeeding()));
+        let worker = Worker::new(repo.clone(), registry, RateLimiter::new(), CircuitBreaker::disabled());
+        worker.run_once(10).await.unwrap();
+
+        assert_eq!(repo.get_notification(submitted.id).await.unwrap().status, DeliveryStatus::Delivered);
+    }
+
+    #[tokio::test]
+    async fn a_suppressed_dispatch_is_recorded_in_the_history() {
+        let (repo, _dir) = test_repo().await;
+        let (tenant_id, submitted, address) = seed_for_suppression(&repo).await;
+        suppress_address(&repo, tenant_id, address).await;
+
+        let registry =
+            ChannelRegistry::new().register(ChannelKind::Webhook, Arc::new(FakeChannel::succeeding()));
+        logging_worker(&repo, registry).run_once(10).await.unwrap();
+
+        let attempts = attempts_for(&repo, submitted.id).await;
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].result, AttemptResult::Skipped);
+        assert!(attempts[0].error.as_deref().unwrap().contains("suppressed"));
+        assert!(attempts[0].error.as_deref().unwrap().contains("unsubscribed"), "the reason is recorded");
+    }
+
+    #[tokio::test]
+    async fn a_suppressed_dispatch_costs_no_rate_limit_token() {
+        let (repo, _dir) = test_repo().await;
+        let (tenant_id, _submitted, address) = seed_for_suppression(&repo).await;
+        suppress_address(&repo, tenant_id, address).await;
+        // A second, deliverable notification for a different recipient,
+        // against a bucket holding exactly one token.
+        let other = seed_recipient(&repo, ChannelKind::Webhook).await;
+        let deliverable = seed_notification(&repo, other, 3).await;
+
+        let channel = Arc::new(FakeChannel::succeeding());
+        let registry = ChannelRegistry::new().register(ChannelKind::Webhook, Arc::clone(&channel) as _);
+        let worker = Worker::new(
+            repo.clone(),
+            registry,
+            RateLimiter::new().with_limit(ChannelKind::Webhook, 1, 0.0),
+            CircuitBreaker::disabled(),
+        );
+
+        worker.run_once(10).await.unwrap();
+
+        assert_eq!(
+            repo.get_notification(deliverable.id).await.unwrap().status,
+            DeliveryStatus::Delivered,
+            "the suppressed notification must not have eaten the only token"
+        );
+        assert_eq!(channel.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn suppression_is_checked_even_while_the_breaker_is_open() {
+        let (repo, _dir) = test_repo().await;
+        let (tenant_id, submitted, address) = seed_for_suppression(&repo).await;
+        suppress_address(&repo, tenant_id, address).await;
+
+        // An open breaker would previously have deferred this forever;
+        // "should we send at all" is now settled first, so it ends here.
+        let breaker = CircuitBreaker::new(1, Duration::hours(1));
+        breaker.record_failure(ChannelKind::Webhook, Utc::now());
+        let registry =
+            ChannelRegistry::new().register(ChannelKind::Webhook, Arc::new(FakeChannel::succeeding()));
+        let worker = Worker::new(repo.clone(), registry, RateLimiter::new(), breaker);
+
+        let outcomes = worker.run_once(10).await.unwrap();
+
+        assert_eq!(outcomes[0].1, DispatchOutcome::Suppressed);
+        assert_eq!(repo.get_notification(submitted.id).await.unwrap().status, DeliveryStatus::Suppressed);
     }
 
     // -- delivery attempt log ------------------------------------------

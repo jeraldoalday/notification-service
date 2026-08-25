@@ -117,6 +117,26 @@ impl<R: NotificationRepository> NotificationQueue<R> {
         Ok(notification)
     }
 
+    /// Ends a claimed (`Sending`) notification because the recipient's
+    /// address is on the tenant's suppression list.
+    ///
+    /// Terminal and one-way, unlike `fail`: there is no attempt to record
+    /// because nothing was attempted, no backoff because retrying would
+    /// reach the same suppressed address, and no dead-lettering because
+    /// dead-lettered work is replayable and replaying this would send to
+    /// someone who asked not to be sent to. `attempt_count` is left
+    /// untouched for the same reason it is in `defer` -- no provider saw
+    /// this message.
+    pub async fn suppress(
+        &self,
+        mut notification: Notification,
+        now: DateTime<Utc>,
+    ) -> QueueResult<Notification> {
+        notification.transition(DeliveryStatus::Suppressed, now)?;
+        self.repo.update_notification(&notification).await?;
+        Ok(notification)
+    }
+
     /// Re-queues work that dead-lettered, as a *new* notification cloned
     /// from the old one.
     ///
@@ -187,6 +207,63 @@ mod tests {
             .max_attempts(2)
             .build()
             .unwrap()
+    }
+
+    #[tokio::test]
+    async fn suppress_ends_a_claimed_notification_terminally() {
+        let (queue, _dir) = test_queue().await;
+        queue.submit(sample_notification(), Utc::now()).await.unwrap();
+        let claimed = queue.claim_batch(Utc::now(), 10).await.unwrap().remove(0);
+
+        let suppressed = queue.suppress(claimed, Utc::now()).await.unwrap();
+
+        assert_eq!(suppressed.status, DeliveryStatus::Suppressed);
+        assert!(suppressed.status.is_terminal());
+    }
+
+    #[tokio::test]
+    async fn suppress_spends_no_attempt_and_schedules_no_retry() {
+        let (queue, _dir) = test_queue().await;
+        queue.submit(sample_notification(), Utc::now()).await.unwrap();
+        let claimed = queue.claim_batch(Utc::now(), 10).await.unwrap().remove(0);
+
+        let suppressed = queue.suppress(claimed, Utc::now()).await.unwrap();
+
+        assert_eq!(suppressed.attempt_count, 0, "no provider ever saw this message");
+        assert_eq!(suppressed.scheduled_for, None);
+    }
+
+    #[tokio::test]
+    async fn a_suppressed_notification_is_never_claimed_again() {
+        let (queue, _dir) = test_queue().await;
+        queue.submit(sample_notification(), Utc::now()).await.unwrap();
+        let claimed = queue.claim_batch(Utc::now(), 10).await.unwrap().remove(0);
+        queue.suppress(claimed, Utc::now()).await.unwrap();
+
+        assert!(queue.claim_batch(Utc::now(), 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_suppressed_notification_cannot_be_replayed() {
+        let (queue, _dir) = test_queue().await;
+        queue.submit(sample_notification(), Utc::now()).await.unwrap();
+        let claimed = queue.claim_batch(Utc::now(), 10).await.unwrap().remove(0);
+        let suppressed = queue.suppress(claimed, Utc::now()).await.unwrap();
+
+        // The point of not folding suppression into dead-lettering:
+        // replaying would send to the address that asked not to be sent to.
+        let err = queue.replay(&suppressed, Utc::now()).await.unwrap_err();
+        assert!(matches!(err, QueueError::NotReplayable { .. }), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn suppressing_unclaimed_work_is_rejected_by_the_state_machine() {
+        let (queue, _dir) = test_queue().await;
+        let queued = queue.submit(sample_notification(), Utc::now()).await.unwrap();
+
+        let err = queue.suppress(queued, Utc::now()).await.unwrap_err();
+
+        assert!(matches!(err, QueueError::Core(_)), "{err:?}");
     }
 
     #[tokio::test]

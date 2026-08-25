@@ -22,6 +22,12 @@ pub enum AttemptOutcome {
     Failed,
     Deferred,
     DeadLettered,
+    /// The recipient's address was on the tenant's suppression list, so
+    /// nothing was sent. Counted separately from `Deferred` because it is
+    /// terminal, and separately from `Failed` because nothing went wrong
+    /// -- a rising suppressed count is a list doing its job, not an
+    /// incident.
+    Suppressed,
 }
 
 impl AttemptOutcome {
@@ -31,12 +37,13 @@ impl AttemptOutcome {
             AttemptOutcome::Failed => "failed",
             AttemptOutcome::Deferred => "deferred",
             AttemptOutcome::DeadLettered => "dead_lettered",
+            AttemptOutcome::Suppressed => "suppressed",
         }
     }
 
-    pub fn all() -> [AttemptOutcome; 4] {
+    pub fn all() -> [AttemptOutcome; 5] {
         use AttemptOutcome::*;
-        [Delivered, Failed, Deferred, DeadLettered]
+        [Delivered, Failed, Deferred, DeadLettered, Suppressed]
     }
 }
 
