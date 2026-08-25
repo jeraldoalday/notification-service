@@ -1,10 +1,12 @@
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
-use ns_core::{DeliveryStatus, Notification};
+use ns_core::{AttemptResult, DeliveryAttempt, DeliveryStatus, Notification};
 use ns_metrics::{AttemptOutcome, ServiceMetrics, SkipReason};
 use ns_queue::NotificationQueue;
-use ns_storage::{NotificationRepository, RecipientRepository, TemplateRepository};
+use ns_storage::{
+    DeliveryAttemptRepository, NotificationRepository, RecipientRepository, TemplateRepository,
+};
 use tracing::{info, warn};
 
 use crate::circuit_breaker::CircuitBreaker;
@@ -76,6 +78,11 @@ pub struct Worker<R> {
     /// records nothing and behaves identically, so embedding one in a test
     /// (or in a deployment that doesn't scrape) needs no extra wiring.
     metrics: Option<Arc<ServiceMetrics>>,
+    /// Where the per-attempt history goes. Also optional, and for a
+    /// stronger reason than the other two: the log is a record of
+    /// delivery, not a part of it, so a worker without one must still
+    /// deliver exactly as it would with one.
+    attempts: Option<Arc<dyn DeliveryAttemptRepository>>,
 }
 
 impl<R: NotificationRepository + RecipientRepository + Clone> Worker<R> {
@@ -93,6 +100,7 @@ impl<R: NotificationRepository + RecipientRepository + Clone> Worker<R> {
             circuit_breaker,
             templates: None,
             metrics: None,
+            attempts: None,
         }
     }
 
@@ -111,6 +119,46 @@ impl<R: NotificationRepository + RecipientRepository + Clone> Worker<R> {
     pub fn with_metrics(mut self, metrics: Arc<ServiceMetrics>) -> Self {
         self.metrics = Some(metrics);
         self
+    }
+
+    /// Gives this worker somewhere to write each attempt's outcome, which
+    /// is what turns "attempt 4 of 5" on a dead-lettered notification into
+    /// an answerable question.
+    pub fn with_attempt_log(mut self, attempts: Arc<dyn DeliveryAttemptRepository>) -> Self {
+        self.attempts = Some(attempts);
+        self
+    }
+
+    /// Writes one line of delivery history, and swallows any failure to do
+    /// so.
+    ///
+    /// This is the one place in the worker where a storage error does not
+    /// abort the pass. Everywhere else that would be wrong -- if the queue
+    /// can't be updated, continuing means double-sending. Here it is the
+    /// only defensible choice: the notification has already been sent (or
+    /// already been refused), and failing the dispatch over an unwritable
+    /// audit row would turn a logging problem into a duplicate message.
+    /// The warning is what an operator sees instead.
+    async fn log_attempt(&self, attempt: DeliveryAttempt) {
+        let Some(attempts) = &self.attempts else {
+            return;
+        };
+
+        if let Err(err) = attempts.record_attempt(&attempt).await {
+            warn!(
+                notification_id = %attempt.notification_id,
+                error = %err,
+                "could not record delivery attempt; delivery itself was unaffected"
+            );
+        }
+    }
+
+    /// Records an attempt that never reached a provider, alongside the
+    /// reason. Every caller pairs this with `defer` or `fail` -- the log
+    /// entry says what happened, the queue call decides what happens next.
+    async fn log_skip(&self, notification: &Notification, reason: String, now: DateTime<Utc>) {
+        self.log_attempt(DeliveryAttempt::new(notification, AttemptResult::Skipped, now).with_error(reason))
+            .await;
     }
 
     fn record_skip(&self, notification: &Notification, reason: SkipReason) {
@@ -168,6 +216,11 @@ impl<R: NotificationRepository + RecipientRepository + Clone> Worker<R> {
         // tokens discovering that.
         if let Err(err) = self.render_if_templated(&mut notification).await {
             warn!(notification_id = %notification.id, error = %err, "could not render template");
+            // Logged as a skip rather than a failure even though it does
+            // spend an attempt: nothing reached a provider, and an
+            // operator scanning the log for a provider's health should not
+            // find this service's own rendering problem among the results.
+            self.log_skip(&notification, err.to_string(), now).await;
             let failed = self.queue.fail(notification, now).await?;
             return Ok(outcome_from_status(failed.status));
         }
@@ -181,18 +234,28 @@ impl<R: NotificationRepository + RecipientRepository + Clone> Worker<R> {
         // around about when the breaker is ready to trial one.
         if !self.circuit_breaker.allow(notification.channel, now) {
             self.record_skip(&notification, SkipReason::CircuitOpen);
+            self.log_skip(&notification, format!("circuit breaker open for {}", notification.channel), now)
+                .await;
             self.queue.defer(notification, self.circuit_breaker.cooldown(), now).await?;
             return Ok(DispatchOutcome::Deferred);
         }
 
         if !self.rate_limiter.try_acquire(notification.channel, now) {
             self.record_skip(&notification, SkipReason::RateLimited);
+            self.log_skip(&notification, format!("rate limit exhausted for {}", notification.channel), now)
+                .await;
             self.queue.defer(notification, RATE_LIMIT_DEFER, now).await?;
             return Ok(DispatchOutcome::Deferred);
         }
 
         let Some(channel) = self.channels.get(notification.channel) else {
             warn!(channel = %notification.channel, "no channel registered, failing notification");
+            self.log_skip(
+                &notification,
+                format!("no {} channel is registered on this worker", notification.channel),
+                now,
+            )
+            .await;
             let failed = self.queue.fail(notification, now).await?;
             return Ok(outcome_from_status(failed.status));
         };
@@ -201,6 +264,7 @@ impl<R: NotificationRepository + RecipientRepository + Clone> Worker<R> {
             Ok(recipient) => recipient,
             Err(err) => {
                 warn!(notification_id = %notification.id, error = %err, "could not load recipient");
+                self.log_skip(&notification, err.to_string(), now).await;
                 let failed = self.queue.fail(notification, now).await?;
                 return Ok(outcome_from_status(failed.status));
             }
@@ -210,6 +274,7 @@ impl<R: NotificationRepository + RecipientRepository + Clone> Worker<R> {
             Ok(address) => address,
             Err(err) => {
                 warn!(notification_id = %notification.id, error = %err, "recipient missing address");
+                self.log_skip(&notification, err.to_string(), now).await;
                 let failed = self.queue.fail(notification, now).await?;
                 return Ok(outcome_from_status(failed.status));
             }
@@ -222,19 +287,32 @@ impl<R: NotificationRepository + RecipientRepository + Clone> Worker<R> {
         // would drag every percentile down.
         let started = std::time::Instant::now();
         let result = channel.send(&notification, address).await;
+        let elapsed = started.elapsed();
         if let Some(metrics) = &self.metrics {
-            metrics.observe_send_duration(notification.channel, started.elapsed().as_secs_f64());
+            metrics.observe_send_duration(notification.channel, elapsed.as_secs_f64());
         }
+        let duration_ms = elapsed.as_millis().min(u128::from(u64::MAX)) as u64;
 
         match result {
             Ok(()) => {
                 self.circuit_breaker.record_success(notification.channel);
+                self.log_attempt(
+                    DeliveryAttempt::new(&notification, AttemptResult::Delivered, now)
+                        .with_duration_ms(duration_ms),
+                )
+                .await;
                 self.queue.complete(notification, now).await?;
                 Ok(DispatchOutcome::Delivered)
             }
             Err(err) => {
                 self.circuit_breaker.record_failure(notification.channel, now);
                 warn!(notification_id = %notification.id, error = %err, "delivery attempt failed");
+                self.log_attempt(
+                    DeliveryAttempt::new(&notification, AttemptResult::Failed, now)
+                        .with_error(err.to_string())
+                        .with_duration_ms(duration_ms),
+                )
+                .await;
                 let failed = self.queue.fail(notification, now).await?;
                 Ok(outcome_from_status(failed.status))
             }
@@ -375,6 +453,211 @@ mod tests {
             .build()
             .unwrap();
         queue.submit(notification, Utc::now()).await.unwrap()
+    }
+
+    // -- delivery attempt log ------------------------------------------
+
+    /// A worker wired to write its history, plus the storage to read it
+    /// back from. Every attempt-log test wants both halves.
+    fn logging_worker(repo: &SqliteStorage, registry: ChannelRegistry) -> Worker<SqliteStorage> {
+        Worker::new(repo.clone(), registry, RateLimiter::new(), CircuitBreaker::disabled())
+            .with_attempt_log(Arc::new(repo.clone()))
+    }
+
+    async fn attempts_for(repo: &SqliteStorage, notification_id: Uuid) -> Vec<DeliveryAttempt> {
+        repo.list_attempts(notification_id, 50).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_successful_send_is_recorded_as_one_delivered_attempt() {
+        let (repo, _dir) = test_repo().await;
+        let recipient_id = seed_recipient(&repo, ChannelKind::Webhook).await;
+        let submitted = seed_notification(&repo, recipient_id, 3).await;
+
+        let registry =
+            ChannelRegistry::new().register(ChannelKind::Webhook, Arc::new(FakeChannel::succeeding()));
+        logging_worker(&repo, registry).run_once(10).await.unwrap();
+
+        let attempts = attempts_for(&repo, submitted.id).await;
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].result, AttemptResult::Delivered);
+        assert_eq!(attempts[0].attempt_number, 1);
+        assert_eq!(attempts[0].tenant_id, submitted.tenant_id);
+        assert_eq!(attempts[0].error, None);
+        assert!(attempts[0].duration_ms.is_some(), "a send that reached a provider has a duration");
+    }
+
+    #[tokio::test]
+    async fn a_rejected_send_records_what_the_provider_said() {
+        let (repo, _dir) = test_repo().await;
+        let recipient_id = seed_recipient(&repo, ChannelKind::Webhook).await;
+        let submitted = seed_notification(&repo, recipient_id, 3).await;
+
+        let registry =
+            ChannelRegistry::new().register(ChannelKind::Webhook, Arc::new(FakeChannel::failing()));
+        logging_worker(&repo, registry).run_once(10).await.unwrap();
+
+        let attempts = attempts_for(&repo, submitted.id).await;
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].result, AttemptResult::Failed);
+        assert!(attempts[0].error.as_deref().unwrap().contains("simulated rejection"));
+        assert!(attempts[0].reached_provider());
+    }
+
+    #[tokio::test]
+    async fn each_retry_appends_a_numbered_line_of_history() {
+        let (repo, _dir) = test_repo().await;
+        let recipient_id = seed_recipient(&repo, ChannelKind::Webhook).await;
+        let submitted = seed_notification(&repo, recipient_id, 3).await;
+
+        let registry =
+            ChannelRegistry::new().register(ChannelKind::Webhook, Arc::new(FakeChannel::failing()));
+        let worker = logging_worker(&repo, registry);
+
+        // Three passes, each clearing the backoff the previous one set, so
+        // the notification is due again.
+        for _ in 0..3 {
+            let mut stored = repo.get_notification(submitted.id).await.unwrap();
+            stored.scheduled_for = None;
+            repo.update_notification(&stored).await.unwrap();
+            worker.run_once(10).await.unwrap();
+        }
+
+        let attempts = attempts_for(&repo, submitted.id).await;
+        assert_eq!(attempts.iter().map(|a| a.attempt_number).collect::<Vec<_>>(), vec![1, 2, 3]);
+        assert!(attempts.iter().all(|a| a.result == AttemptResult::Failed));
+        assert_eq!(repo.get_notification(submitted.id).await.unwrap().status, DeliveryStatus::DeadLettered);
+    }
+
+    #[tokio::test]
+    async fn a_rate_limited_dispatch_is_recorded_as_a_skip() {
+        let (repo, _dir) = test_repo().await;
+        let recipient_id = seed_recipient(&repo, ChannelKind::Webhook).await;
+        let submitted = seed_notification(&repo, recipient_id, 3).await;
+
+        let registry =
+            ChannelRegistry::new().register(ChannelKind::Webhook, Arc::new(FakeChannel::succeeding()));
+        let worker = Worker::new(
+            repo.clone(),
+            registry,
+            RateLimiter::new().with_limit(ChannelKind::Webhook, 0, 0.0),
+            CircuitBreaker::disabled(),
+        )
+        .with_attempt_log(Arc::new(repo.clone()));
+
+        worker.run_once(10).await.unwrap();
+
+        let attempts = attempts_for(&repo, submitted.id).await;
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].result, AttemptResult::Skipped);
+        assert!(!attempts[0].reached_provider());
+        assert!(attempts[0].error.as_deref().unwrap().contains("rate limit"));
+        assert_eq!(attempts[0].duration_ms, None, "nothing was timed, because nothing was sent");
+    }
+
+    #[tokio::test]
+    async fn a_skip_does_not_advance_the_attempt_number_the_next_send_gets() {
+        let (repo, _dir) = test_repo().await;
+        let recipient_id = seed_recipient(&repo, ChannelKind::Webhook).await;
+        let submitted = seed_notification(&repo, recipient_id, 3).await;
+
+        // First pass: no tokens, so the dispatch is skipped and deferred.
+        let registry =
+            ChannelRegistry::new().register(ChannelKind::Webhook, Arc::new(FakeChannel::succeeding()));
+        Worker::new(
+            repo.clone(),
+            registry,
+            RateLimiter::new().with_limit(ChannelKind::Webhook, 0, 0.0),
+            CircuitBreaker::disabled(),
+        )
+        .with_attempt_log(Arc::new(repo.clone()))
+        .run_once(10)
+        .await
+        .unwrap();
+
+        // Second pass: the defer's delay is cleared and the limiter is
+        // open, so the send actually happens.
+        let mut stored = repo.get_notification(submitted.id).await.unwrap();
+        stored.scheduled_for = None;
+        repo.update_notification(&stored).await.unwrap();
+        let registry =
+            ChannelRegistry::new().register(ChannelKind::Webhook, Arc::new(FakeChannel::succeeding()));
+        logging_worker(&repo, registry).run_once(10).await.unwrap();
+
+        let attempts = attempts_for(&repo, submitted.id).await;
+        let numbered: Vec<(u32, AttemptResult)> =
+            attempts.iter().map(|a| (a.attempt_number, a.result)).collect();
+        assert_eq!(
+            numbered,
+            vec![(1, AttemptResult::Skipped), (1, AttemptResult::Delivered)],
+            "the send was still the notification's first real attempt"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unregistered_channel_is_recorded_as_a_skip_naming_it() {
+        let (repo, _dir) = test_repo().await;
+        let recipient_id = seed_recipient(&repo, ChannelKind::Webhook).await;
+        let submitted = seed_notification(&repo, recipient_id, 3).await;
+
+        logging_worker(&repo, ChannelRegistry::new()).run_once(10).await.unwrap();
+
+        let attempts = attempts_for(&repo, submitted.id).await;
+        assert_eq!(attempts[0].result, AttemptResult::Skipped);
+        assert!(attempts[0].error.as_deref().unwrap().contains("webhook"));
+    }
+
+    #[tokio::test]
+    async fn an_unrenderable_template_is_recorded_as_a_skip() {
+        let (repo, _dir) = test_repo().await;
+        let recipient_id = seed_recipient(&repo, ChannelKind::Webhook).await;
+        let queue = NotificationQueue::new(repo.clone());
+        let notification = Notification::builder(Uuid::new_v4(), recipient_id, ChannelKind::Webhook)
+            .template("nonexistent")
+            .build()
+            .unwrap();
+        let submitted = queue.submit(notification, Utc::now()).await.unwrap();
+
+        let registry =
+            ChannelRegistry::new().register(ChannelKind::Webhook, Arc::new(FakeChannel::succeeding()));
+        // No template store configured, so rendering can't even be tried.
+        logging_worker(&repo, registry).run_once(10).await.unwrap();
+
+        let attempts = attempts_for(&repo, submitted.id).await;
+        assert_eq!(attempts[0].result, AttemptResult::Skipped);
+        assert!(!attempts[0].reached_provider(), "the service's own problem, not the provider's");
+    }
+
+    #[tokio::test]
+    async fn a_worker_without_an_attempt_log_delivers_identically() {
+        let (repo, _dir) = test_repo().await;
+        let recipient_id = seed_recipient(&repo, ChannelKind::Webhook).await;
+        let submitted = seed_notification(&repo, recipient_id, 3).await;
+
+        let registry =
+            ChannelRegistry::new().register(ChannelKind::Webhook, Arc::new(FakeChannel::succeeding()));
+        let worker = Worker::new(repo.clone(), registry, RateLimiter::new(), CircuitBreaker::disabled());
+
+        let outcomes = worker.run_once(10).await.unwrap();
+
+        assert_eq!(outcomes[0].1, DispatchOutcome::Delivered);
+        assert_eq!(repo.get_notification(submitted.id).await.unwrap().status, DeliveryStatus::Delivered);
+        assert!(attempts_for(&repo, submitted.id).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn one_notifications_history_does_not_bleed_into_anothers() {
+        let (repo, _dir) = test_repo().await;
+        let recipient_id = seed_recipient(&repo, ChannelKind::Webhook).await;
+        let first = seed_notification(&repo, recipient_id, 3).await;
+        let second = seed_notification(&repo, recipient_id, 3).await;
+
+        let registry =
+            ChannelRegistry::new().register(ChannelKind::Webhook, Arc::new(FakeChannel::succeeding()));
+        logging_worker(&repo, registry).run_once(10).await.unwrap();
+
+        assert_eq!(attempts_for(&repo, first.id).await.len(), 1);
+        assert_eq!(attempts_for(&repo, second.id).await.len(), 1);
     }
 
     #[tokio::test]
