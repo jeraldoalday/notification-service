@@ -10,7 +10,7 @@ pub mod suppression;
 pub use attempt::{AttemptResult, DeliveryAttempt};
 pub use channel::{Channel, ChannelKind};
 pub use error::{CoreError, CoreResult};
-pub use notification::{Notification, NotificationBuilder};
+pub use notification::{Notification, NotificationBuilder, MAX_ATTEMPTS_CEILING};
 pub use priority::Priority;
 pub use recipient::{Recipient, RecipientAddress};
 pub use status::DeliveryStatus;

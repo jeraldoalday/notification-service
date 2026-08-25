@@ -414,3 +414,32 @@ async fn list_limit_is_capped() {
     let listed: Value = json_body(response).await;
     assert_eq!(listed.as_array().unwrap().len(), 3);
 }
+
+/// Backoff caps at fifteen minutes, so an unbounded attempt budget
+/// doesn't retry for longer -- it retries forever, and every one of those
+/// retries is a row the worker's batch has to return before it can return
+/// anything else.
+#[tokio::test]
+async fn an_unbounded_retry_budget_is_refused() {
+    let (app, _dir) = test_app().await;
+    let recipient_id = create_recipient(&app).await;
+
+    let response = send(
+        &app,
+        post_json(
+            "/notifications",
+            json!({
+                "tenant_id": TENANT,
+                "recipient_id": recipient_id,
+                "channel": "email",
+                "body": "retry me forever",
+                "max_attempts": 4294967295u32
+            }),
+        ),
+    )
+    .await;
+
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body: Value = json_body(response).await;
+    assert!(body["error"].as_str().unwrap().contains("max_attempts"), "{body}");
+}

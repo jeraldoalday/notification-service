@@ -8,6 +8,22 @@ use crate::error::{CoreError, CoreResult};
 use crate::priority::Priority;
 use crate::status::DeliveryStatus;
 
+/// Ceiling on a notification's `max_attempts`.
+///
+/// There has to be one. Retry backoff caps at fifteen minutes, so a
+/// notification with a large budget doesn't retry for longer -- it retries
+/// forever, every fifteen minutes, and every one of those retries is a row
+/// `due_for_delivery` has to return before it can return anything else. A
+/// caller passing `max_attempts: 4294967295` therefore doesn't just
+/// inconvenience itself: at `Critical` priority it occupies the front of
+/// every worker batch indefinitely, and the notifications behind it never
+/// go out at all.
+///
+/// Twenty attempts against a fifteen-minute cap is a little over four
+/// hours of retrying, which is longer than any outage worth waiting out
+/// with a retry loop rather than a replay.
+pub const MAX_ATTEMPTS_CEILING: u32 = 20;
+
 /// A single notification: one recipient, one channel, one message.
 /// Fan-out to multiple channels for the same logical event is handled by
 /// creating multiple `Notification`s upstream (see `ns-queue`).
@@ -52,7 +68,11 @@ impl Notification {
     }
 
     pub fn record_attempt(&mut self, now: DateTime<Utc>) {
-        self.attempt_count += 1;
+        // Saturating rather than wrapping: `build` bounds `max_attempts`,
+        // so this can't be reached in practice, but a count that wrapped
+        // to zero would hand a notification an unlimited retry budget --
+        // exactly the thing the bound exists to prevent.
+        self.attempt_count = self.attempt_count.saturating_add(1);
         self.updated_at = now;
     }
 
@@ -136,6 +156,17 @@ impl NotificationBuilder {
         if self.max_attempts == 0 {
             return Err(CoreError::Validation("max_attempts must be at least 1".into()));
         }
+        // Refused rather than clamped, unlike an over-large list `limit`.
+        // A caller asking for a thousand attempts and silently getting
+        // twenty has been told something untrue about when its
+        // notification will stop being retried; a caller asking for a
+        // thousand rows and getting five hundred just pages again.
+        if self.max_attempts > MAX_ATTEMPTS_CEILING {
+            return Err(CoreError::Validation(format!(
+                "max_attempts must be at most {MAX_ATTEMPTS_CEILING}, got {}",
+                self.max_attempts
+            )));
+        }
 
         let now = Utc::now();
         Ok(Notification {
@@ -198,6 +229,42 @@ mod tests {
             .build()
             .unwrap_err();
         assert!(matches!(err, CoreError::Validation(_)));
+    }
+
+    #[test]
+    fn rejects_max_attempts_beyond_the_ceiling() {
+        // Unbounded attempts don't retry for longer -- backoff caps at
+        // fifteen minutes -- they retry forever, and at high priority they
+        // sit at the front of every worker batch while they do it.
+        let err = Notification::builder(Uuid::new_v4(), Uuid::new_v4(), ChannelKind::Email)
+            .body("hi")
+            .max_attempts(u32::MAX)
+            .build()
+            .unwrap_err();
+        assert!(matches!(err, CoreError::Validation(_)));
+        assert!(err.to_string().contains(&MAX_ATTEMPTS_CEILING.to_string()), "{err}");
+    }
+
+    #[test]
+    fn accepts_max_attempts_at_the_ceiling() {
+        let n = Notification::builder(Uuid::new_v4(), Uuid::new_v4(), ChannelKind::Email)
+            .body("hi")
+            .max_attempts(MAX_ATTEMPTS_CEILING)
+            .build()
+            .unwrap();
+        assert_eq!(n.max_attempts, MAX_ATTEMPTS_CEILING);
+    }
+
+    #[test]
+    fn the_attempt_count_can_never_wrap_past_its_budget() {
+        let mut n = build_ok();
+        n.attempt_count = u32::MAX;
+        n.record_attempt(Utc::now());
+
+        // Wrapping to zero would hand the notification an unlimited retry
+        // budget, which is the thing the ceiling exists to prevent.
+        assert_eq!(n.attempt_count, u32::MAX);
+        assert!(!n.has_attempts_remaining());
     }
 
     #[test]
