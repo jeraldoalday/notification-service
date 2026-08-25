@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use ns_auth::ApiKey;
-use ns_core::{DeliveryStatus, Notification, Recipient};
+use ns_core::{DeliveryAttempt, DeliveryStatus, Notification, Recipient};
 use ns_templates::Template;
 use uuid::Uuid;
 
@@ -133,4 +133,37 @@ pub trait ApiKeyRepository: Send + Sync {
 
     /// Persists the current state of `key` -- in practice, its revocation.
     async fn update_api_key(&self, key: &ApiKey) -> StorageResult<()>;
+}
+
+/// Persistence for `DeliveryAttempt`s: the append-only record of what the
+/// service actually did on each try.
+///
+/// Deliberately append-only. There is no `update_attempt`, because an
+/// attempt describes a moment that has already passed and a log that can
+/// be rewritten is not evidence of anything. The only way a row leaves is
+/// `purge_attempts_before`, which drops whole time ranges rather than
+/// individual records.
+#[async_trait]
+pub trait DeliveryAttemptRepository: Send + Sync {
+    async fn record_attempt(&self, attempt: &DeliveryAttempt) -> StorageResult<()>;
+
+    /// One notification's attempts, oldest first, capped at `limit`.
+    ///
+    /// Chronological rather than newest-first -- the opposite of every
+    /// other listing here -- because this is read as a narrative: an
+    /// operator wants the rate-limit skip that came before the rejection
+    /// that came before the dead-letter, in that order.
+    async fn list_attempts(&self, notification_id: Uuid, limit: u32) -> StorageResult<Vec<DeliveryAttempt>>;
+
+    /// A tenant's most recent attempts across all its notifications,
+    /// newest-first, capped at `limit`. This is the "what is failing right
+    /// now" view, which is a different question from one notification's
+    /// history.
+    async fn list_tenant_attempts(&self, tenant_id: Uuid, limit: u32) -> StorageResult<Vec<DeliveryAttempt>>;
+
+    /// Deletes every attempt recorded before `cutoff`, returning how many
+    /// rows went. This table grows without bound otherwise: it is the only
+    /// one where a single notification writes many rows, and nothing else
+    /// ever removes one.
+    async fn purge_attempts_before(&self, cutoff: DateTime<Utc>) -> StorageResult<u64>;
 }

@@ -4,14 +4,17 @@ use std::str::FromStr;
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
 use ns_auth::ApiKey;
-use ns_core::{DeliveryStatus, Notification, Recipient};
+use ns_core::{DeliveryAttempt, DeliveryStatus, Notification, Recipient};
 use ns_templates::Template;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use sqlx::Row;
 use uuid::Uuid;
 
 use crate::error::{StorageError, StorageResult};
-use crate::repository::{ApiKeyRepository, NotificationRepository, RecipientRepository, TemplateRepository};
+use crate::repository::{
+    ApiKeyRepository, DeliveryAttemptRepository, NotificationRepository, RecipientRepository,
+    TemplateRepository,
+};
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
 
@@ -452,6 +455,84 @@ impl ApiKeyRepository for SqliteStorage {
     }
 }
 
+#[async_trait]
+impl DeliveryAttemptRepository for SqliteStorage {
+    async fn record_attempt(&self, attempt: &DeliveryAttempt) -> StorageResult<()> {
+        let data = serde_json::to_string(attempt)?;
+        sqlx::query(
+            "INSERT INTO delivery_attempts
+                (id, notification_id, tenant_id, result, occurred_at, data)
+             VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(attempt.id.to_string())
+        .bind(attempt.notification_id.to_string())
+        .bind(attempt.tenant_id.to_string())
+        .bind(attempt.result.as_str())
+        .bind(to_ts(attempt.occurred_at))
+        .bind(data)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn list_attempts(&self, notification_id: Uuid, limit: u32) -> StorageResult<Vec<DeliveryAttempt>> {
+        // `id` breaks ties after `occurred_at`, because two attempts on
+        // the same notification can land in the same millisecond -- a
+        // rate-limit skip is recorded without ever waiting on a provider
+        // -- and an unstable order would shuffle the history between two
+        // reads of the same rows.
+        let rows = sqlx::query(
+            "SELECT data FROM delivery_attempts
+             WHERE notification_id = ?
+             ORDER BY occurred_at ASC, id ASC
+             LIMIT ?",
+        )
+        .bind(notification_id.to_string())
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        decode_attempts(rows)
+    }
+
+    async fn list_tenant_attempts(&self, tenant_id: Uuid, limit: u32) -> StorageResult<Vec<DeliveryAttempt>> {
+        let rows = sqlx::query(
+            "SELECT data FROM delivery_attempts
+             WHERE tenant_id = ?
+             ORDER BY occurred_at DESC, id ASC
+             LIMIT ?",
+        )
+        .bind(tenant_id.to_string())
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        decode_attempts(rows)
+    }
+
+    async fn purge_attempts_before(&self, cutoff: DateTime<Utc>) -> StorageResult<u64> {
+        // Compared as a string against the same fixed-width RFC 3339
+        // format every timestamp here is written in, which is exactly why
+        // `to_ts` pads: lexical ordering has to agree with chronological
+        // ordering for this range delete to mean what it says.
+        let result = sqlx::query("DELETE FROM delivery_attempts WHERE occurred_at < ?")
+            .bind(to_ts(cutoff))
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
+    }
+}
+
+/// Shared by the two attempt listings, which differ only in their ORDER BY.
+fn decode_attempts(rows: Vec<sqlx::sqlite::SqliteRow>) -> StorageResult<Vec<DeliveryAttempt>> {
+    rows.into_iter()
+        .map(|row| {
+            let data: String = row.try_get("data")?;
+            Ok(serde_json::from_str(&data)?)
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -484,6 +565,174 @@ mod tests {
             .with_display_name("Ada Lovelace")
             .with_address(RecipientAddress::Email("ada@example.com".into()))
             .unwrap()
+    }
+
+    fn sample_attempt(notification: &Notification, result: ns_core::AttemptResult) -> DeliveryAttempt {
+        DeliveryAttempt::new(notification, result, Utc::now())
+    }
+
+    #[tokio::test]
+    async fn records_and_lists_a_notifications_attempts() {
+        use ns_core::AttemptResult;
+        let (storage, _dir) = test_storage().await;
+        let notification = sample_notification();
+
+        let attempt = sample_attempt(&notification, AttemptResult::Failed).with_error("550 mailbox full");
+        storage.record_attempt(&attempt).await.unwrap();
+
+        let listed = storage.list_attempts(notification.id, 10).await.unwrap();
+        assert_eq!(listed, vec![attempt]);
+    }
+
+    #[tokio::test]
+    async fn attempts_list_oldest_first() {
+        use ns_core::AttemptResult;
+        let (storage, _dir) = test_storage().await;
+        let notification = sample_notification();
+
+        let mut recorded = Vec::new();
+        for minutes_ago in [3, 2, 1] {
+            let mut attempt = sample_attempt(&notification, AttemptResult::Failed);
+            attempt.occurred_at = Utc::now() - Duration::minutes(minutes_ago);
+            storage.record_attempt(&attempt).await.unwrap();
+            recorded.push(attempt);
+        }
+
+        let listed = storage.list_attempts(notification.id, 10).await.unwrap();
+        let order: Vec<Uuid> = listed.iter().map(|a| a.id).collect();
+        assert_eq!(order, recorded.iter().map(|a| a.id).collect::<Vec<_>>(), "history reads forwards");
+    }
+
+    #[tokio::test]
+    async fn attempts_are_scoped_to_their_own_notification() {
+        use ns_core::AttemptResult;
+        let (storage, _dir) = test_storage().await;
+        let mine = sample_notification();
+        let theirs = sample_notification();
+
+        storage.record_attempt(&sample_attempt(&mine, AttemptResult::Delivered)).await.unwrap();
+        storage.record_attempt(&sample_attempt(&theirs, AttemptResult::Delivered)).await.unwrap();
+
+        assert_eq!(storage.list_attempts(mine.id, 10).await.unwrap().len(), 1);
+        assert_eq!(storage.list_attempts(theirs.id, 10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn listing_attempts_respects_the_limit() {
+        use ns_core::AttemptResult;
+        let (storage, _dir) = test_storage().await;
+        let notification = sample_notification();
+
+        for _ in 0..5 {
+            storage.record_attempt(&sample_attempt(&notification, AttemptResult::Skipped)).await.unwrap();
+        }
+
+        assert_eq!(storage.list_attempts(notification.id, 2).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_notification_with_no_attempts_lists_none() {
+        let (storage, _dir) = test_storage().await;
+        assert!(storage.list_attempts(Uuid::new_v4(), 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tenant_attempts_span_notifications_newest_first() {
+        use ns_core::AttemptResult;
+        let (storage, _dir) = test_storage().await;
+        let tenant = Uuid::new_v4();
+
+        let mut newest = None;
+        for minutes_ago in [5, 1, 3] {
+            let mut notification = sample_notification();
+            notification.tenant_id = tenant;
+            let mut attempt = sample_attempt(&notification, AttemptResult::Failed);
+            attempt.occurred_at = Utc::now() - Duration::minutes(minutes_ago);
+            storage.record_attempt(&attempt).await.unwrap();
+            if minutes_ago == 1 {
+                newest = Some(attempt.id);
+            }
+        }
+
+        let listed = storage.list_tenant_attempts(tenant, 10).await.unwrap();
+        assert_eq!(listed.len(), 3);
+        assert_eq!(listed[0].id, newest.unwrap());
+    }
+
+    #[tokio::test]
+    async fn one_tenants_attempts_are_invisible_to_another() {
+        use ns_core::AttemptResult;
+        let (storage, _dir) = test_storage().await;
+        let notification = sample_notification();
+        storage.record_attempt(&sample_attempt(&notification, AttemptResult::Delivered)).await.unwrap();
+
+        assert!(storage.list_tenant_attempts(Uuid::new_v4(), 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn purging_drops_only_attempts_older_than_the_cutoff() {
+        use ns_core::AttemptResult;
+        let (storage, _dir) = test_storage().await;
+        let notification = sample_notification();
+
+        let mut old = sample_attempt(&notification, AttemptResult::Failed);
+        old.occurred_at = Utc::now() - Duration::days(40);
+        storage.record_attempt(&old).await.unwrap();
+
+        let recent = sample_attempt(&notification, AttemptResult::Delivered);
+        storage.record_attempt(&recent).await.unwrap();
+
+        let purged = storage.purge_attempts_before(Utc::now() - Duration::days(30)).await.unwrap();
+
+        assert_eq!(purged, 1);
+        let remaining = storage.list_attempts(notification.id, 10).await.unwrap();
+        assert_eq!(remaining.iter().map(|a| a.id).collect::<Vec<_>>(), vec![recent.id]);
+    }
+
+    #[tokio::test]
+    async fn purging_a_range_with_nothing_in_it_removes_nothing() {
+        use ns_core::AttemptResult;
+        let (storage, _dir) = test_storage().await;
+        let notification = sample_notification();
+        storage.record_attempt(&sample_attempt(&notification, AttemptResult::Delivered)).await.unwrap();
+
+        assert_eq!(storage.purge_attempts_before(Utc::now() - Duration::days(1)).await.unwrap(), 0);
+        assert_eq!(storage.list_attempts(notification.id, 10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn purging_attempts_leaves_the_notification_alone() {
+        use ns_core::AttemptResult;
+        let (storage, _dir) = test_storage().await;
+        let notification = sample_notification();
+        storage.insert_notification(&notification).await.unwrap();
+
+        let mut old = sample_attempt(&notification, AttemptResult::Failed);
+        old.occurred_at = Utc::now() - Duration::days(90);
+        storage.record_attempt(&old).await.unwrap();
+
+        storage.purge_attempts_before(Utc::now()).await.unwrap();
+
+        // And the reverse holds by construction: there is no foreign key,
+        // so the log outlives its subject too.
+        assert!(storage.get_notification(notification.id).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn an_attempts_full_record_round_trips() {
+        use ns_core::AttemptResult;
+        let (storage, _dir) = test_storage().await;
+        let notification = sample_notification();
+
+        let attempt = sample_attempt(&notification, AttemptResult::Failed)
+            .with_error("connection reset by peer")
+            .with_duration_ms(1234);
+        storage.record_attempt(&attempt).await.unwrap();
+
+        let fetched = storage.list_attempts(notification.id, 1).await.unwrap().remove(0);
+        assert_eq!(fetched, attempt);
+        assert_eq!(fetched.error.as_deref(), Some("connection reset by peer"));
+        assert_eq!(fetched.duration_ms, Some(1234));
     }
 
     #[tokio::test]
