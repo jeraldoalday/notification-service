@@ -2,7 +2,10 @@ use std::sync::Arc;
 
 use ns_metrics::ServiceMetrics;
 use ns_queue::NotificationQueue;
-use ns_storage::{ApiKeyRepository, NotificationRepository, RecipientRepository, TemplateRepository};
+use ns_storage::{
+    ApiKeyRepository, DeliveryAttemptRepository, NotificationRepository, RecipientRepository,
+    TemplateRepository,
+};
 
 use crate::auth::AuthMode;
 
@@ -23,6 +26,7 @@ pub trait Repositories:
     + RecipientRepository
     + TemplateRepository
     + ApiKeyRepository
+    + DeliveryAttemptRepository
     + Clone
     + Send
     + Sync
@@ -35,6 +39,7 @@ impl<R> Repositories for R where
         + RecipientRepository
         + TemplateRepository
         + ApiKeyRepository
+        + DeliveryAttemptRepository
         + Clone
         + Send
         + Sync

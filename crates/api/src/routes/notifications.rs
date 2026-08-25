@@ -5,7 +5,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use chrono::{DateTime, Utc};
 use ns_auth::Scope;
-use ns_core::{ChannelKind, DeliveryStatus, Notification, Priority};
+use ns_core::{AttemptResult, ChannelKind, DeliveryAttempt, DeliveryStatus, Notification, Priority};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -41,6 +41,64 @@ const DEFAULT_LIST_LIMIT: u32 = 50;
 /// rejecting keeps a caller paging with an over-large limit working, just
 /// bounded.
 const MAX_LIST_LIMIT: u32 = 500;
+
+/// Attempts are per-notification and far more numerous than
+/// notifications, so they get their own, larger, default: a caller asking
+/// for one notification's history almost always wants all of it, and
+/// `max_attempts` is single digits even before rate-limit skips are
+/// counted.
+const DEFAULT_ATTEMPT_LIMIT: u32 = 100;
+const MAX_ATTEMPT_LIMIT: u32 = 1000;
+
+#[derive(Debug, Deserialize)]
+pub struct ListAttemptsQuery {
+    pub limit: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ListTenantAttemptsQuery {
+    pub tenant_id: Option<Uuid>,
+    pub limit: Option<u32>,
+}
+
+/// One line of delivery history as the API reports it.
+///
+/// `tenant_id` is deliberately absent even though the stored record
+/// carries one: every route reaching this is already scoped to a single
+/// tenant, so echoing it back adds a field to every element of a
+/// hundred-item list and tells the caller only what it already said.
+#[derive(Debug, Serialize)]
+pub struct DeliveryAttemptResponse {
+    pub id: Uuid,
+    pub notification_id: Uuid,
+    pub channel: ChannelKind,
+    pub attempt_number: u32,
+    pub result: AttemptResult,
+    /// True when this attempt actually reached a provider, and so says
+    /// something about that provider rather than about this service.
+    /// Derived rather than stored, so a client doesn't have to know which
+    /// results imply it.
+    pub reached_provider: bool,
+    pub error: Option<String>,
+    pub duration_ms: Option<u64>,
+    pub occurred_at: DateTime<Utc>,
+}
+
+impl From<DeliveryAttempt> for DeliveryAttemptResponse {
+    fn from(attempt: DeliveryAttempt) -> Self {
+        Self {
+            reached_provider: attempt.reached_provider(),
+            id: attempt.id,
+            notification_id: attempt.notification_id,
+            channel: attempt.channel,
+            attempt_number: attempt.attempt_number,
+            result: attempt.result,
+            error: attempt.error,
+            duration_ms: attempt.duration_ms,
+            occurred_at: attempt.occurred_at,
+        }
+    }
+}
 
 #[derive(Debug, Deserialize)]
 pub struct SubmitNotificationRequest {
@@ -227,4 +285,60 @@ where
     let limit = query.limit.unwrap_or(DEFAULT_LIST_LIMIT).min(MAX_LIST_LIMIT);
     let notifications = state.repo.list_by_tenant(tenant_id, query.status, limit).await?;
     Ok(Json(notifications.into_iter().map(NotificationResponse::from).collect()))
+}
+
+/// A notification's delivery history, oldest attempt first.
+///
+/// The listing this serves is the answer to "why is this notification
+/// dead-lettered?", which the notification itself can't give: its row
+/// holds a final status and an attempt count, and the interesting part --
+/// which provider refused it, what it said, whether the attempts were
+/// rejections or rate-limit skips -- only exists here.
+///
+/// It's a subresource of the notification rather than a filter on a
+/// top-level collection because the tenant check is the notification's:
+/// an attempt is only reachable through the thing it describes, so an id
+/// belonging to someone else answers 404 in exactly the same way a
+/// straight GET of that notification would.
+pub async fn list_notification_attempts<R>(
+    State(state): State<AppState<R>>,
+    caller: Caller,
+    Path(id): Path<Uuid>,
+    Query(query): Query<ListAttemptsQuery>,
+) -> ApiResult<Json<Vec<DeliveryAttemptResponse>>>
+where
+    R: Repositories,
+{
+    caller.require(Scope::Read)?;
+    let notification = state.repo.get_notification(id).await?;
+    hide_other_tenants(caller.require_tenant(notification.tenant_id), || {
+        format!("notification {id} not found")
+    })?;
+
+    let limit = query.limit.unwrap_or(DEFAULT_ATTEMPT_LIMIT).min(MAX_ATTEMPT_LIMIT);
+    let attempts = state.repo.list_attempts(id, limit).await?;
+    Ok(Json(attempts.into_iter().map(DeliveryAttemptResponse::from).collect()))
+}
+
+/// A tenant's most recent attempts across all its notifications,
+/// newest-first.
+///
+/// A different question from the one above, and the reason it gets its own
+/// route: "what is failing right now" is answered by scanning recent
+/// attempts, not by knowing which notification to ask about. The tenant
+/// comes from the key, so this cannot reach across the boundary even
+/// though it isn't scoped to a particular id.
+pub async fn list_attempts<R>(
+    State(state): State<AppState<R>>,
+    caller: Caller,
+    Query(query): Query<ListTenantAttemptsQuery>,
+) -> ApiResult<Json<Vec<DeliveryAttemptResponse>>>
+where
+    R: Repositories,
+{
+    caller.require(Scope::Read)?;
+    let tenant_id = caller.tenant_for(query.tenant_id)?;
+    let limit = query.limit.unwrap_or(DEFAULT_ATTEMPT_LIMIT).min(MAX_ATTEMPT_LIMIT);
+    let attempts = state.repo.list_tenant_attempts(tenant_id, limit).await?;
+    Ok(Json(attempts.into_iter().map(DeliveryAttemptResponse::from).collect()))
 }

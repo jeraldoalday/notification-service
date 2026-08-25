@@ -43,6 +43,8 @@ where
         )
         .route("/notifications/{id}", get(notifications::get_notification))
         .route("/notifications/{id}/cancel", post(notifications::cancel_notification))
+        .route("/notifications/{id}/attempts", get(notifications::list_notification_attempts))
+        .route("/attempts", get(notifications::list_attempts))
         .route("/templates", post(templates::create_template).get(templates::list_templates))
         .route(
             "/templates/{id}",
