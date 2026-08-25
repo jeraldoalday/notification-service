@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
-use ns_core::{ChannelKind, DeliveryStatus, Notification, Priority};
+use ns_core::{ChannelKind, DeliveryAttempt, DeliveryStatus, Notification, Priority};
 use ns_queue::NotificationQueue;
-use ns_storage::{NotificationRepository, RecipientRepository, SqliteStorage, TemplateRepository};
+use ns_storage::{
+    DeliveryAttemptRepository, NotificationRepository, RecipientRepository, SqliteStorage, TemplateRepository,
+};
 use uuid::Uuid;
 
 use crate::error::{CliError, CliResult};
@@ -97,6 +99,49 @@ pub fn summary_table(notifications: &[Notification]) -> String {
         })
         .collect();
     table(&["id", "channel", "status", "attempts", "created"], &rows)
+}
+
+/// Shows one notification's delivery history, oldest attempt first.
+///
+/// This is the command an operator reaches for after `notification show`
+/// says `dead_lettered` and `attempts: 5/5`, which between them explain
+/// nothing about why.
+pub async fn attempts(
+    storage: &SqliteStorage,
+    id: Uuid,
+    limit: u32,
+    output: OutputFormat,
+) -> CliResult<String> {
+    // Fetched first so an unknown id reports itself as one, rather than as
+    // a notification that happens to have no history.
+    storage.get_notification(id).await?;
+    let attempts = storage.list_attempts(id, limit).await?;
+    output.render(&attempts, || attempt_table(&attempts))
+}
+
+/// One line per attempt. The error column comes last and is left
+/// unpadded, because it's the only variable-width field and putting it
+/// anywhere else would push every following column out of alignment the
+/// moment one provider gets verbose.
+fn attempt_table(attempts: &[DeliveryAttempt]) -> String {
+    if attempts.is_empty() {
+        return "no delivery attempts recorded\n".to_string();
+    }
+
+    let rows: Vec<Vec<String>> = attempts
+        .iter()
+        .map(|a| {
+            vec![
+                a.attempt_number.to_string(),
+                a.result.to_string(),
+                a.channel.to_string(),
+                a.duration_ms.map(|ms| format!("{ms}ms")).unwrap_or_else(|| "-".to_string()),
+                a.occurred_at.to_rfc3339(),
+                a.error.clone().unwrap_or_default(),
+            ]
+        })
+        .collect();
+    table(&["#", "result", "channel", "took", "at", "error"], &rows)
 }
 
 /// Cancels a notification that hasn't started sending. The refusal comes

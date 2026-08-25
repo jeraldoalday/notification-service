@@ -213,6 +213,14 @@ pub enum NotificationCommand {
         limit: u32,
     },
 
+    /// Show one notification's delivery history, oldest attempt first.
+    Attempts {
+        id: Uuid,
+
+        #[arg(long, default_value_t = 100)]
+        limit: u32,
+    },
+
     /// Cancel a notification that hasn't started sending yet.
     Cancel { id: Uuid },
 
@@ -281,5 +289,15 @@ pub enum QueueCommand {
 
         #[arg(long, default_value_t = 25)]
         limit: u32,
+    },
+
+    /// Delete delivery attempts older than a cutoff.
+    ///
+    /// The attempt log is the one table that grows without bound, so this
+    /// is the retention job -- run it from cron. Notifications themselves
+    /// are never touched.
+    PurgeAttempts {
+        #[arg(long, default_value_t = 30)]
+        older_than_days: i64,
     },
 }

@@ -1,7 +1,7 @@
-use chrono::Utc;
+use chrono::{Duration, Utc};
 use ns_core::DeliveryStatus;
 use ns_queue::NotificationQueue;
-use ns_storage::{NotificationRepository, SqliteStorage};
+use ns_storage::{DeliveryAttemptRepository, NotificationRepository, SqliteStorage};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -80,5 +80,46 @@ pub async fn replay(
             return "nothing dead-lettered to replay\n".to_string();
         }
         format!("replayed {} notification(s)\n{}", replayed.len(), summary_table(&replayed))
+    })
+}
+
+#[derive(Debug, Serialize)]
+pub struct PurgeReport {
+    pub cutoff: chrono::DateTime<Utc>,
+    pub purged: u64,
+}
+
+/// Drops delivery attempts older than `older_than_days`.
+///
+/// The attempt log is the only table here where one notification writes
+/// many rows and nothing ever removes one, so it is the only table with a
+/// retention story -- and this is it, run from cron on the host the
+/// service lives on. Notifications are deliberately left alone: they are
+/// small, they are what callers hold ids for, and deciding when a delivery
+/// record stops mattering is a policy question this tool shouldn't answer
+/// on an operator's behalf.
+pub async fn purge_attempts(
+    storage: &SqliteStorage,
+    older_than_days: i64,
+    output: OutputFormat,
+) -> CliResult<String> {
+    if older_than_days < 1 {
+        return Err(crate::error::CliError::Invalid(
+            "--older-than-days must be at least 1; purging up to this instant would delete the \
+             attempt that is being recorded right now"
+                .into(),
+        ));
+    }
+
+    let cutoff = Utc::now() - Duration::days(older_than_days);
+    let purged = storage.purge_attempts_before(cutoff).await?;
+
+    let report = PurgeReport { cutoff, purged };
+    output.render(&report, || {
+        format!(
+            "purged {} delivery attempt(s) recorded before {}\n",
+            report.purged,
+            report.cutoff.to_rfc3339()
+        )
     })
 }

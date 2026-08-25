@@ -33,6 +33,9 @@ async fn run() -> CliResult<()> {
         Command::Notification(NotificationCommand::List { tenant, status, limit }) => {
             commands::notification::list(&storage, tenant, status, limit, cli.output).await?
         }
+        Command::Notification(NotificationCommand::Attempts { id, limit }) => {
+            commands::notification::attempts(&storage, id, limit, cli.output).await?
+        }
         Command::Notification(NotificationCommand::Cancel { id }) => {
             commands::notification::cancel(&storage, id, cli.output).await?
         }
@@ -86,6 +89,9 @@ async fn run() -> CliResult<()> {
         }
         Command::Queue(QueueCommand::Replay { tenant, limit }) => {
             commands::queue::replay(&storage, tenant, limit, cli.output).await?
+        }
+        Command::Queue(QueueCommand::PurgeAttempts { older_than_days }) => {
+            commands::queue::purge_attempts(&storage, older_than_days, cli.output).await?
         }
         Command::Apikey(ApikeyCommand::Create { tenant, name, scopes }) => {
             commands::apikey::create(&storage, tenant, name, scopes, cli.output).await?
