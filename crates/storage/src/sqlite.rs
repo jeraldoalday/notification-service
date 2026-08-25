@@ -59,6 +59,7 @@ fn status_str(status: DeliveryStatus) -> &'static str {
         DeliveryStatus::Failed => "failed",
         DeliveryStatus::DeadLettered => "dead_lettered",
         DeliveryStatus::Cancelled => "cancelled",
+        DeliveryStatus::Suppressed => "suppressed",
     }
 }
 

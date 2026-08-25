@@ -26,6 +26,53 @@ impl RecipientAddress {
         }
     }
 
+    /// Builds the address of `channel`'s kind from a bare string.
+    ///
+    /// The inverse of `channel_kind`, for the callers -- a suppression
+    /// query string, a CLI flag -- that receive a channel and a value as
+    /// two separate fields rather than as this enum's tagged JSON. Keeping
+    /// the mapping here means those callers can't invent a different one.
+    pub fn for_channel(channel: ChannelKind, value: impl Into<String>) -> Self {
+        let value = value.into();
+        match channel {
+            ChannelKind::Email => RecipientAddress::Email(value),
+            ChannelKind::Sms => RecipientAddress::Phone(value),
+            ChannelKind::Push => RecipientAddress::PushToken(value),
+            ChannelKind::Webhook => RecipientAddress::WebhookUrl(value),
+        }
+    }
+
+    /// The raw address, whichever variant this is.
+    pub fn value(&self) -> &str {
+        match self {
+            RecipientAddress::Email(value)
+            | RecipientAddress::Phone(value)
+            | RecipientAddress::PushToken(value)
+            | RecipientAddress::WebhookUrl(value) => value,
+        }
+    }
+
+    /// The normalised form this address is suppressed under.
+    ///
+    /// Email is lowercased; nothing else is. Domains are case-insensitive
+    /// outright, and while RFC 5321 does permit a case-sensitive
+    /// local-part, no mail system in practice treats `Ada@` and `ada@` as
+    /// different people -- so matching case-sensitively would let an
+    /// unsubscribe be defeated by a shift key. Suppression is the one
+    /// place where the safe failure is to match too much: sending to
+    /// someone who asked you not to is a much worse outcome than declining
+    /// to send to an address that merely looks like theirs.
+    ///
+    /// Push tokens, webhook URLs and phone numbers are left verbatim,
+    /// because for those, case really is significant -- a token is an
+    /// opaque credential and a URL path is case-sensitive by spec.
+    pub fn suppression_key(&self) -> String {
+        match self {
+            RecipientAddress::Email(address) => address.to_lowercase(),
+            other => other.value().to_string(),
+        }
+    }
+
     /// Cheap, dependency-free sanity checks. Full validation (MX lookups,
     /// carrier lookups, etc.) belongs in the channel providers.
     pub fn validate(&self) -> CoreResult<()> {
@@ -170,6 +217,34 @@ mod tests {
     #[test]
     fn rejects_empty_push_token() {
         assert!(RecipientAddress::PushToken("  ".into()).validate().is_err());
+    }
+
+    #[test]
+    fn for_channel_is_the_inverse_of_channel_kind() {
+        for channel in ChannelKind::all() {
+            let address = RecipientAddress::for_channel(channel, "whatever");
+            assert_eq!(address.channel_kind(), channel);
+            assert_eq!(address.value(), "whatever");
+        }
+    }
+
+    #[test]
+    fn an_email_is_suppressed_case_insensitively() {
+        let shouted = RecipientAddress::Email("Ada@Example.COM".into());
+        let quiet = RecipientAddress::Email("ada@example.com".into());
+        assert_eq!(shouted.suppression_key(), quiet.suppression_key());
+    }
+
+    #[test]
+    fn other_address_kinds_keep_their_case() {
+        // A push token is an opaque credential and a URL path is
+        // case-sensitive by spec, so folding case here would merge two
+        // genuinely different destinations.
+        let token = RecipientAddress::PushToken("AbC123".into());
+        assert_eq!(token.suppression_key(), "AbC123");
+
+        let url = RecipientAddress::WebhookUrl("https://example.com/Hook".into());
+        assert_eq!(url.suppression_key(), "https://example.com/Hook");
     }
 
     #[test]

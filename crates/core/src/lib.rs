@@ -5,6 +5,7 @@ pub mod notification;
 pub mod priority;
 pub mod recipient;
 pub mod status;
+pub mod suppression;
 
 pub use attempt::{AttemptResult, DeliveryAttempt};
 pub use channel::{Channel, ChannelKind};
@@ -13,3 +14,4 @@ pub use notification::{Notification, NotificationBuilder};
 pub use priority::Priority;
 pub use recipient::{Recipient, RecipientAddress};
 pub use status::DeliveryStatus;
+pub use suppression::{Suppression, SuppressionReason};
