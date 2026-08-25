@@ -15,19 +15,56 @@ use crate::state::{AppState, Repositories};
 /// unbounded number of time series just by requesting random paths.
 const UNMATCHED_ROUTE: &str = "<unmatched>";
 
+/// Label used for a request method this service doesn't serve.
+///
+/// HTTP allows extension methods -- any token is a syntactically valid
+/// method -- and hyper parses them faithfully, so `request.method()` is
+/// attacker-controlled text with no bounded set of values. Reporting it
+/// verbatim is the same unbounded-cardinality hole `UNMATCHED_ROUTE`
+/// exists to close, just through a different field: a client looping over
+/// random method tokens mints a new time series per request, and the
+/// registry holds every series it has ever created until the process
+/// restarts.
+const OTHER_METHOD: &str = "<other>";
+
+/// The methods this service actually routes. Anything else is folded into
+/// `OTHER_METHOD` rather than labelled with itself.
+///
+/// An allowlist rather than a length or character check, because the
+/// question isn't whether the method is well-formed -- an attacker can
+/// send well-formed methods all day -- but whether it is one of the
+/// finitely many this service can answer.
+fn method_label(method: &axum::http::Method) -> &'static str {
+    use axum::http::Method;
+    match *method {
+        Method::GET => "GET",
+        Method::POST => "POST",
+        Method::PUT => "PUT",
+        Method::PATCH => "PATCH",
+        Method::DELETE => "DELETE",
+        Method::HEAD => "HEAD",
+        Method::OPTIONS => "OPTIONS",
+        Method::TRACE => "TRACE",
+        Method::CONNECT => "CONNECT",
+        _ => OTHER_METHOD,
+    }
+}
+
 /// Records one counter and one latency observation per request, plus an
 /// in-flight gauge.
 ///
-/// The route label comes from axum's `MatchedPath` -- the *pattern*
-/// (`/notifications/{id}`), not the concrete path -- so the series count
-/// stays proportional to the size of the route table rather than to the
-/// number of notifications the service has ever handled.
+/// Both labels are drawn from bounded sets, which is what keeps the
+/// series count proportional to the size of the route table rather than
+/// to the traffic. The route comes from axum's `MatchedPath` -- the
+/// *pattern* (`/notifications/{id}`), not the concrete path -- and the
+/// method is mapped through `method_label`, since HTTP permits arbitrary
+/// extension method tokens and hyper passes them straight through.
 pub async fn track_requests(
     State(metrics): State<Arc<ServiceMetrics>>,
     request: Request,
     next: Next,
 ) -> Response {
-    let method = request.method().to_string();
+    let method = method_label(request.method());
     let route = request
         .extensions()
         .get::<MatchedPath>()
@@ -40,8 +77,8 @@ pub async fn track_requests(
     let elapsed = started.elapsed().as_secs_f64();
     metrics.http_in_flight().dec();
 
-    metrics.http_requests(&method, &route, response.status().as_u16()).inc();
-    metrics.http_duration(&method, &route).observe(elapsed);
+    metrics.http_requests(method, &route, response.status().as_u16()).inc();
+    metrics.http_duration(method, &route).observe(elapsed);
 
     response
 }

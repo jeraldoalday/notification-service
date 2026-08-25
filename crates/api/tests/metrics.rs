@@ -1,6 +1,7 @@
 mod support;
 
-use axum::http::StatusCode;
+use axum::body::Body;
+use axum::http::{Request, StatusCode};
 use support::{get, json_body, post_json, send, test_app};
 
 async fn text_body(response: axum::http::Response<axum::body::Body>) -> String {
@@ -165,4 +166,39 @@ async fn exposition_is_stable_between_scrapes_of_an_idle_service() {
         bump(&second, 1).lines().filter(|line| !line.contains("duration_seconds")).collect::<Vec<_>>(),
         bump(&third, 2).lines().filter(|line| !line.contains("duration_seconds")).collect::<Vec<_>>()
     );
+}
+
+/// HTTP permits arbitrary extension methods, and hyper parses them
+/// faithfully, so `request.method()` is attacker-controlled text. Left
+/// unbounded it mints a fresh time series per distinct token, and the
+/// registry keeps every series it ever creates -- a client looping over
+/// random methods grows the process's memory until it dies.
+#[tokio::test]
+async fn an_unrecognised_method_does_not_mint_a_time_series() {
+    let (app, _dir) = test_app().await;
+
+    for method in ["FOOBAR", "QUUX", "ZZZZ"] {
+        let request = Request::builder().method(method).uri("/health").body(Body::empty()).unwrap();
+        send(&app, request).await;
+    }
+
+    let exposition = scrape(&app).await;
+
+    for method in ["FOOBAR", "QUUX", "ZZZZ"] {
+        assert!(!exposition.contains(method), "`{method}` reached a label:\n{exposition}");
+    }
+    assert!(
+        exposition.contains("method=\"<other>\""),
+        "the requests are still counted, just folded together:\n{exposition}"
+    );
+}
+
+#[tokio::test]
+async fn the_methods_the_service_serves_keep_their_own_label() {
+    let (app, _dir) = test_app().await;
+
+    send(&app, get("/health")).await;
+
+    let exposition = scrape(&app).await;
+    assert!(exposition.contains("method=\"GET\""), "{exposition}");
 }
