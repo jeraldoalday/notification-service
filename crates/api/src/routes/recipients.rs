@@ -3,13 +3,12 @@ use axum::http::StatusCode;
 use axum::Json;
 use ns_auth::Scope;
 use ns_core::{Recipient, RecipientAddress};
-use ns_storage::{ApiKeyRepository, NotificationRepository, RecipientRepository, TemplateRepository};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::auth::Caller;
 use crate::error::{ApiError, ApiJson, ApiResult};
-use crate::state::AppState;
+use crate::state::{AppState, Repositories};
 
 #[derive(Debug, Deserialize)]
 pub struct CreateRecipientRequest {
@@ -55,7 +54,7 @@ pub async fn create_recipient<R>(
     ApiJson(request): ApiJson<CreateRecipientRequest>,
 ) -> ApiResult<(StatusCode, Json<RecipientResponse>)>
 where
-    R: NotificationRepository + RecipientRepository + TemplateRepository + ApiKeyRepository + Clone,
+    R: Repositories,
 {
     caller.require(Scope::Write)?;
     let tenant_id = caller.tenant_for(request.tenant_id)?;
@@ -78,7 +77,7 @@ pub async fn get_recipient<R>(
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<RecipientResponse>>
 where
-    R: NotificationRepository + RecipientRepository + TemplateRepository + ApiKeyRepository + Clone,
+    R: Repositories,
 {
     caller.require(Scope::Read)?;
     let recipient = state.repo.get_recipient(id).await?;

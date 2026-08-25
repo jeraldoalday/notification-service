@@ -5,11 +5,10 @@ use axum::http::HeaderMap;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use ns_auth::{AuthContext, AuthError, Scope};
-use ns_storage::{ApiKeyRepository, NotificationRepository, RecipientRepository, TemplateRepository};
 use uuid::Uuid;
 
 use crate::error::{ApiError, ApiResult};
-use crate::state::AppState;
+use crate::state::{AppState, Repositories};
 
 /// Whether the API checks credentials at all.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -115,14 +114,7 @@ impl<S: Send + Sync> FromRequestParts<S> for Caller {
 /// the response time from distinguishing the two.
 pub async fn authenticate<R>(State(state): State<AppState<R>>, mut request: Request, next: Next) -> Response
 where
-    R: NotificationRepository
-        + RecipientRepository
-        + TemplateRepository
-        + ApiKeyRepository
-        + Clone
-        + Send
-        + Sync
-        + 'static,
+    R: Repositories,
 {
     let caller = match state.auth {
         AuthMode::Disabled => Caller::Unauthenticated,
@@ -148,14 +140,7 @@ where
 /// no tower `Service` will accept.
 async fn authenticated_caller<R>(state: &AppState<R>, headers: &HeaderMap) -> Result<Caller, ApiError>
 where
-    R: NotificationRepository
-        + RecipientRepository
-        + TemplateRepository
-        + ApiKeyRepository
-        + Clone
-        + Send
-        + Sync
-        + 'static,
+    R: Repositories,
 {
     let header = headers
         .get(AUTHORIZATION)

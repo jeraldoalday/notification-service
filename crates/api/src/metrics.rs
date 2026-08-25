@@ -6,10 +6,9 @@ use axum::http::header::CONTENT_TYPE;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use ns_metrics::{prometheus, ServiceMetrics};
-use ns_storage::{NotificationRepository, RecipientRepository, TemplateRepository};
 
 use crate::error::ApiResult;
-use crate::state::AppState;
+use crate::state::{AppState, Repositories};
 
 /// Label used for a request that matched no route. Reporting the raw URI
 /// instead would let anyone scanning the service for endpoints mint an
@@ -58,7 +57,7 @@ pub async fn track_requests(
 /// scrape frequency.
 pub async fn metrics_endpoint<R>(State(state): State<AppState<R>>) -> ApiResult<Response>
 where
-    R: NotificationRepository + RecipientRepository + TemplateRepository + Clone,
+    R: Repositories,
 {
     let counts = state.repo.count_by_status(None).await?;
     state.metrics.set_queue_depth(&counts);

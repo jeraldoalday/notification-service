@@ -6,6 +6,42 @@ use ns_storage::{ApiKeyRepository, NotificationRepository, RecipientRepository, 
 
 use crate::auth::AuthMode;
 
+/// Every repository the API needs, as a single bound.
+///
+/// `AppState` is generic over its storage so the router can be built over
+/// a test double as easily as over `SqliteStorage`, but that genericity
+/// was being paid for in full at every one of the fifteen-odd handlers:
+/// each repeated the same list of traits, and adding one meant editing all
+/// of them. Collapsing the list into one trait keeps the flexibility and
+/// puts the list in a single place.
+///
+/// It is a blanket-implemented marker rather than a trait anyone writes an
+/// impl for -- any type satisfying the parts satisfies the whole,
+/// automatically.
+pub trait Repositories:
+    NotificationRepository
+    + RecipientRepository
+    + TemplateRepository
+    + ApiKeyRepository
+    + Clone
+    + Send
+    + Sync
+    + 'static
+{
+}
+
+impl<R> Repositories for R where
+    R: NotificationRepository
+        + RecipientRepository
+        + TemplateRepository
+        + ApiKeyRepository
+        + Clone
+        + Send
+        + Sync
+        + 'static
+{
+}
+
 /// Shared state handed to every request handler: a `NotificationQueue` for
 /// the submit/claim/complete/fail lifecycle, plus direct access to the
 /// underlying repository for reads (`get_notification`, `get_recipient`,
@@ -42,7 +78,7 @@ where
 
 impl<R> AppState<R>
 where
-    R: NotificationRepository + RecipientRepository + TemplateRepository + ApiKeyRepository + Clone,
+    R: Repositories,
 {
     /// State with authentication required, which is what a deployment
     /// should want; `without_auth` is the deliberate opt-out.

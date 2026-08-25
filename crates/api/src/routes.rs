@@ -2,10 +2,9 @@ use std::sync::Arc;
 
 use axum::routing::{get, post};
 use axum::Router;
-use ns_storage::{ApiKeyRepository, NotificationRepository, RecipientRepository, TemplateRepository};
 use tower_http::trace::TraceLayer;
 
-use crate::state::AppState;
+use crate::state::{AppState, Repositories};
 
 pub mod api_keys;
 mod health;
@@ -19,14 +18,7 @@ pub mod templates;
 /// repository traits it needs.
 pub fn build_router<R>(state: AppState<R>) -> Router
 where
-    R: NotificationRepository
-        + RecipientRepository
-        + TemplateRepository
-        + ApiKeyRepository
-        + Clone
-        + Send
-        + Sync
-        + 'static,
+    R: Repositories,
 {
     let metrics = Arc::clone(&state.metrics);
 

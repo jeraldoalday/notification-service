@@ -6,13 +6,12 @@ use axum::Json;
 use chrono::{DateTime, Utc};
 use ns_auth::Scope;
 use ns_core::{ChannelKind, DeliveryStatus, Notification, Priority};
-use ns_storage::{ApiKeyRepository, NotificationRepository, RecipientRepository, TemplateRepository};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::auth::Caller;
 use crate::error::{ApiError, ApiJson, ApiResult};
-use crate::state::AppState;
+use crate::state::{AppState, Repositories};
 
 /// Turns "this belongs to another tenant" into "this doesn't exist" for
 /// lookups by id.
@@ -116,7 +115,7 @@ pub async fn submit_notification<R>(
     ApiJson(request): ApiJson<SubmitNotificationRequest>,
 ) -> ApiResult<(StatusCode, Json<NotificationResponse>)>
 where
-    R: NotificationRepository + RecipientRepository + TemplateRepository + ApiKeyRepository + Clone,
+    R: Repositories,
 {
     caller.require(Scope::Write)?;
     let tenant_id = caller.tenant_for(request.tenant_id)?;
@@ -175,7 +174,7 @@ pub async fn get_notification<R>(
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<NotificationResponse>>
 where
-    R: NotificationRepository + RecipientRepository + TemplateRepository + ApiKeyRepository + Clone,
+    R: Repositories,
 {
     caller.require(Scope::Read)?;
     let notification = state.repo.get_notification(id).await?;
@@ -196,7 +195,7 @@ pub async fn cancel_notification<R>(
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<NotificationResponse>>
 where
-    R: NotificationRepository + RecipientRepository + TemplateRepository + ApiKeyRepository + Clone,
+    R: Repositories,
 {
     caller.require(Scope::Write)?;
     let mut notification = state.repo.get_notification(id).await?;
@@ -221,7 +220,7 @@ pub async fn list_notifications<R>(
     Query(query): Query<ListNotificationsQuery>,
 ) -> ApiResult<Json<Vec<NotificationResponse>>>
 where
-    R: NotificationRepository + RecipientRepository + TemplateRepository + ApiKeyRepository + Clone,
+    R: Repositories,
 {
     caller.require(Scope::Read)?;
     let tenant_id = caller.tenant_for(query.tenant_id)?;

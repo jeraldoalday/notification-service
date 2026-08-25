@@ -3,13 +3,12 @@ use axum::http::StatusCode;
 use axum::Json;
 use chrono::{DateTime, Utc};
 use ns_auth::{ApiKey, Scope};
-use ns_storage::{ApiKeyRepository, NotificationRepository, RecipientRepository, TemplateRepository};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::auth::Caller;
 use crate::error::{ApiError, ApiJson, ApiResult};
-use crate::state::AppState;
+use crate::state::{AppState, Repositories};
 
 const DEFAULT_LIST_LIMIT: u32 = 50;
 const MAX_LIST_LIMIT: u32 = 500;
@@ -77,7 +76,7 @@ pub async fn create_api_key<R>(
     ApiJson(request): ApiJson<CreateApiKeyRequest>,
 ) -> ApiResult<(StatusCode, Json<CreatedApiKeyResponse>)>
 where
-    R: NotificationRepository + RecipientRepository + TemplateRepository + ApiKeyRepository + Clone,
+    R: Repositories,
 {
     caller.require(Scope::Admin)?;
     let tenant_id = caller.tenant_for(None)?;
@@ -107,7 +106,7 @@ pub async fn list_api_keys<R>(
     Query(query): Query<ListApiKeysQuery>,
 ) -> ApiResult<Json<Vec<ApiKeyResponse>>>
 where
-    R: NotificationRepository + RecipientRepository + TemplateRepository + ApiKeyRepository + Clone,
+    R: Repositories,
 {
     caller.require(Scope::Admin)?;
     let tenant_id = caller.tenant_for(None)?;
@@ -126,7 +125,7 @@ pub async fn revoke_api_key<R>(
     Path(id): Path<Uuid>,
 ) -> ApiResult<Json<ApiKeyResponse>>
 where
-    R: NotificationRepository + RecipientRepository + TemplateRepository + ApiKeyRepository + Clone,
+    R: Repositories,
 {
     caller.require(Scope::Admin)?;
 
