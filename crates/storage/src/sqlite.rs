@@ -4,7 +4,7 @@ use std::str::FromStr;
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
 use ns_auth::ApiKey;
-use ns_core::{DeliveryAttempt, DeliveryStatus, Notification, Recipient};
+use ns_core::{DeliveryAttempt, DeliveryStatus, Notification, Recipient, RecipientAddress, Suppression};
 use ns_templates::Template;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use sqlx::Row;
@@ -13,7 +13,7 @@ use uuid::Uuid;
 use crate::error::{StorageError, StorageResult};
 use crate::repository::{
     ApiKeyRepository, DeliveryAttemptRepository, NotificationRepository, RecipientRepository,
-    TemplateRepository,
+    SuppressionRepository, TemplateRepository,
 };
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
@@ -534,6 +534,92 @@ fn decode_attempts(rows: Vec<sqlx::sqlite::SqliteRow>) -> StorageResult<Vec<Deli
         .collect()
 }
 
+#[async_trait]
+impl SuppressionRepository for SqliteStorage {
+    async fn insert_suppression(&self, suppression: &Suppression) -> StorageResult<()> {
+        let data = serde_json::to_string(suppression)?;
+        // Upsert rather than plain insert: the same address legitimately
+        // arrives twice with different reasons -- a bounce, then a
+        // complaint -- and the newer record is the one worth keeping.
+        // `created_at` moves with it, since the row now describes the
+        // later event.
+        sqlx::query(
+            "INSERT INTO suppressions (tenant_id, channel, address_key, reason, created_at, data)
+             VALUES (?, ?, ?, ?, ?, ?)
+             ON CONFLICT (tenant_id, channel, address_key)
+             DO UPDATE SET reason = excluded.reason,
+                           created_at = excluded.created_at,
+                           data = excluded.data",
+        )
+        .bind(suppression.tenant_id.to_string())
+        .bind(suppression.channel().as_str())
+        .bind(suppression.key())
+        .bind(suppression.reason.as_str())
+        .bind(to_ts(suppression.created_at))
+        .bind(data)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn find_suppression(
+        &self,
+        tenant_id: Uuid,
+        address: &RecipientAddress,
+    ) -> StorageResult<Option<Suppression>> {
+        // A point query on the primary key. This runs before every send,
+        // so it has to stay one indexed lookup rather than anything that
+        // grows with the length of the list.
+        let row = sqlx::query(
+            "SELECT data FROM suppressions WHERE tenant_id = ? AND channel = ? AND address_key = ?",
+        )
+        .bind(tenant_id.to_string())
+        .bind(address.channel_kind().as_str())
+        .bind(address.suppression_key())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some(row) => {
+                let data: String = row.try_get("data")?;
+                Ok(Some(serde_json::from_str(&data)?))
+            }
+            None => Ok(None),
+        }
+    }
+
+    async fn list_suppressions(&self, tenant_id: Uuid, limit: u32) -> StorageResult<Vec<Suppression>> {
+        let rows = sqlx::query(
+            "SELECT data FROM suppressions
+             WHERE tenant_id = ?
+             ORDER BY created_at DESC, address_key ASC
+             LIMIT ?",
+        )
+        .bind(tenant_id.to_string())
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|row| {
+                let data: String = row.try_get("data")?;
+                Ok(serde_json::from_str(&data)?)
+            })
+            .collect()
+    }
+
+    async fn delete_suppression(&self, tenant_id: Uuid, address: &RecipientAddress) -> StorageResult<bool> {
+        let result =
+            sqlx::query("DELETE FROM suppressions WHERE tenant_id = ? AND channel = ? AND address_key = ?")
+                .bind(tenant_id.to_string())
+                .bind(address.channel_kind().as_str())
+                .bind(address.suppression_key())
+                .execute(&self.pool)
+                .await?;
+        Ok(result.rows_affected() > 0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -734,6 +820,163 @@ mod tests {
         assert_eq!(fetched, attempt);
         assert_eq!(fetched.error.as_deref(), Some("connection reset by peer"));
         assert_eq!(fetched.duration_ms, Some(1234));
+    }
+
+    fn suppression(tenant_id: Uuid, address: RecipientAddress) -> Suppression {
+        Suppression::new(tenant_id, address, ns_core::SuppressionReason::Unsubscribed, Utc::now()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn suppresses_and_finds_an_address() {
+        let (storage, _dir) = test_storage().await;
+        let tenant = Uuid::new_v4();
+        let address = RecipientAddress::Email("ada@example.com".into());
+
+        let entry = suppression(tenant, address.clone());
+        storage.insert_suppression(&entry).await.unwrap();
+
+        assert_eq!(storage.find_suppression(tenant, &address).await.unwrap(), Some(entry));
+    }
+
+    #[tokio::test]
+    async fn an_unsuppressed_address_is_simply_absent() {
+        let (storage, _dir) = test_storage().await;
+        let address = RecipientAddress::Email("ada@example.com".into());
+
+        assert_eq!(storage.find_suppression(Uuid::new_v4(), &address).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn suppression_matches_an_email_whatever_its_case() {
+        let (storage, _dir) = test_storage().await;
+        let tenant = Uuid::new_v4();
+        storage
+            .insert_suppression(&suppression(tenant, RecipientAddress::Email("Ada@Example.COM".into())))
+            .await
+            .unwrap();
+
+        let looked_up = RecipientAddress::Email("ada@example.com".into());
+        assert!(storage.find_suppression(tenant, &looked_up).await.unwrap().is_some());
+    }
+
+    #[tokio::test]
+    async fn suppression_is_scoped_to_one_tenant() {
+        let (storage, _dir) = test_storage().await;
+        let address = RecipientAddress::Email("ada@example.com".into());
+        storage.insert_suppression(&suppression(Uuid::new_v4(), address.clone())).await.unwrap();
+
+        assert_eq!(storage.find_suppression(Uuid::new_v4(), &address).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn suppression_is_scoped_to_one_channel() {
+        let (storage, _dir) = test_storage().await;
+        let tenant = Uuid::new_v4();
+        // A push token and a webhook URL could in principle be the same
+        // string; the channel in the key is what keeps them apart.
+        storage
+            .insert_suppression(&suppression(tenant, RecipientAddress::PushToken("shared".into())))
+            .await
+            .unwrap();
+
+        let webhook = RecipientAddress::WebhookUrl("shared".into());
+        assert_eq!(storage.find_suppression(tenant, &webhook).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn re_suppressing_replaces_rather_than_duplicating() {
+        use ns_core::SuppressionReason;
+        let (storage, _dir) = test_storage().await;
+        let tenant = Uuid::new_v4();
+        let address = RecipientAddress::Email("ada@example.com".into());
+
+        storage
+            .insert_suppression(
+                &Suppression::new(tenant, address.clone(), SuppressionReason::Bounced, Utc::now()).unwrap(),
+            )
+            .await
+            .unwrap();
+        storage
+            .insert_suppression(
+                &Suppression::new(tenant, address.clone(), SuppressionReason::Complaint, Utc::now())
+                    .unwrap()
+                    .with_note("provider webhook"),
+            )
+            .await
+            .unwrap();
+
+        let found = storage.find_suppression(tenant, &address).await.unwrap().unwrap();
+        assert_eq!(found.reason, SuppressionReason::Complaint, "the newer record wins");
+        assert_eq!(found.note.as_deref(), Some("provider webhook"));
+        assert_eq!(storage.list_suppressions(tenant, 10).await.unwrap().len(), 1, "and there is only one");
+    }
+
+    #[tokio::test]
+    async fn listing_is_newest_first_and_tenant_scoped() {
+        let (storage, _dir) = test_storage().await;
+        let tenant = Uuid::new_v4();
+
+        let mut older = suppression(tenant, RecipientAddress::Email("older@example.com".into()));
+        older.created_at = Utc::now() - Duration::hours(2);
+        storage.insert_suppression(&older).await.unwrap();
+        let newer = suppression(tenant, RecipientAddress::Email("newer@example.com".into()));
+        storage.insert_suppression(&newer).await.unwrap();
+        storage
+            .insert_suppression(&suppression(Uuid::new_v4(), RecipientAddress::Email("other@x.com".into())))
+            .await
+            .unwrap();
+
+        let listed = storage.list_suppressions(tenant, 10).await.unwrap();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0].address, newer.address);
+    }
+
+    #[tokio::test]
+    async fn listing_suppressions_respects_the_limit() {
+        let (storage, _dir) = test_storage().await;
+        let tenant = Uuid::new_v4();
+        for index in 0..5 {
+            let address = RecipientAddress::Email(format!("user{index}@example.com"));
+            storage.insert_suppression(&suppression(tenant, address)).await.unwrap();
+        }
+
+        assert_eq!(storage.list_suppressions(tenant, 3).await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn deleting_reports_whether_there_was_anything_to_delete() {
+        let (storage, _dir) = test_storage().await;
+        let tenant = Uuid::new_v4();
+        let address = RecipientAddress::Email("ada@example.com".into());
+        storage.insert_suppression(&suppression(tenant, address.clone())).await.unwrap();
+
+        assert!(storage.delete_suppression(tenant, &address).await.unwrap());
+        assert_eq!(storage.find_suppression(tenant, &address).await.unwrap(), None);
+        assert!(!storage.delete_suppression(tenant, &address).await.unwrap(), "deleting again is a no-op");
+    }
+
+    #[tokio::test]
+    async fn deleting_matches_the_same_normalisation_inserting_used() {
+        let (storage, _dir) = test_storage().await;
+        let tenant = Uuid::new_v4();
+        storage
+            .insert_suppression(&suppression(tenant, RecipientAddress::Email("Ada@Example.COM".into())))
+            .await
+            .unwrap();
+
+        let lowered = RecipientAddress::Email("ada@example.com".into());
+        assert!(storage.delete_suppression(tenant, &lowered).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn one_tenant_cannot_delete_anothers_suppression() {
+        let (storage, _dir) = test_storage().await;
+        let owner = Uuid::new_v4();
+        let address = RecipientAddress::Email("ada@example.com".into());
+        storage.insert_suppression(&suppression(owner, address.clone())).await.unwrap();
+
+        assert!(!storage.delete_suppression(Uuid::new_v4(), &address).await.unwrap());
+        assert!(storage.find_suppression(owner, &address).await.unwrap().is_some());
     }
 
     #[tokio::test]

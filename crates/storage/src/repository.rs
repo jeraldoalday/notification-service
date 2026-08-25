@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use ns_auth::ApiKey;
-use ns_core::{DeliveryAttempt, DeliveryStatus, Notification, Recipient};
+use ns_core::{DeliveryAttempt, DeliveryStatus, Notification, Recipient, RecipientAddress, Suppression};
 use ns_templates::Template;
 use uuid::Uuid;
 
@@ -166,4 +166,47 @@ pub trait DeliveryAttemptRepository: Send + Sync {
     /// one where a single notification writes many rows, and nothing else
     /// ever removes one.
     async fn purge_attempts_before(&self, cutoff: DateTime<Utc>) -> StorageResult<u64>;
+}
+
+/// Persistence for `Suppression`s: the addresses a tenant may no longer
+/// send to.
+///
+/// `find_suppression` is on the delivery path -- it runs before every send
+/// -- so it is a point query on the primary key rather than anything that
+/// grows with the size of the list. That is also why the trait takes a
+/// `RecipientAddress` rather than a pre-computed key string: normalising
+/// is the implementation's job, and a caller that computed the key itself
+/// could compute it differently and silently miss a match.
+#[async_trait]
+pub trait SuppressionRepository: Send + Sync {
+    /// Adds an address to the list, replacing any existing entry for it.
+    ///
+    /// Replacing rather than failing is deliberate. Suppressing an
+    /// already-suppressed address is not a mistake worth an error -- the
+    /// caller's intent is satisfied either way -- and the same address
+    /// legitimately arrives twice with different reasons, most often a
+    /// bounce followed by a complaint. Keeping the newer record means the
+    /// list reflects the most recent thing known about the address.
+    async fn insert_suppression(&self, suppression: &Suppression) -> StorageResult<()>;
+
+    /// The suppression covering `address` for `tenant_id`, or `None`.
+    ///
+    /// `None` rather than an error, because "this address is fine to send
+    /// to" is the overwhelmingly common answer and not an exceptional one.
+    async fn find_suppression(
+        &self,
+        tenant_id: Uuid,
+        address: &RecipientAddress,
+    ) -> StorageResult<Option<Suppression>>;
+
+    /// A tenant's suppressions, newest-first, capped at `limit`.
+    async fn list_suppressions(&self, tenant_id: Uuid, limit: u32) -> StorageResult<Vec<Suppression>>;
+
+    /// Removes an address from the list, returning whether there was one
+    /// to remove.
+    ///
+    /// A bool rather than a `NotFound` error: unsuppressing is an
+    /// idempotent operation an operator may well run without knowing the
+    /// current state, and the caller that does care can still tell.
+    async fn delete_suppression(&self, tenant_id: Uuid, address: &RecipientAddress) -> StorageResult<bool>;
 }
