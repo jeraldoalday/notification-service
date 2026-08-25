@@ -12,8 +12,9 @@ overall design and current build status.
 
 Early and under active development. The domain model, configuration layer,
 SQLite storage layer, job queue, channel providers, worker process, HTTP
-API, notification templates, the `ns` admin CLI, Prometheus metrics, and
-API-key authentication with per-tenant isolation are all in place.
+API, notification templates, the `ns` admin CLI, Prometheus metrics,
+API-key authentication with per-tenant isolation, a per-attempt delivery
+history and a per-tenant suppression list are all in place.
 
 ## Workspace layout
 
@@ -54,6 +55,8 @@ database, and serves on `NS_SERVER_HOST:NS_SERVER_PORT` (default
 | GET    | `/recipients/{id}`           | Fetch a recipient                              |
 | POST   | `/notifications`             | Submit a notification (queues it for delivery) |
 | GET    | `/notifications/{id}`        | Fetch a notification's current status          |
+| GET    | `/notifications/{id}/attempts` | Every delivery attempt made for it, oldest first |
+| GET    | `/attempts?tenant_id=`       | A tenant's recent attempts, newest-first       |
 | GET    | `/notifications?tenant_id=`  | List a tenant's notifications, newest-first    |
 | POST   | `/notifications/{id}/cancel` | Cancel a notification that hasn't started sending |
 | POST   | `/templates`                 | Create a template                              |
@@ -62,6 +65,10 @@ database, and serves on `NS_SERVER_HOST:NS_SERVER_PORT` (default
 | PUT    | `/templates/{id}?tenant_id=` | Replace a template's subject and body          |
 | DELETE | `/templates/{id}?tenant_id=` | Delete a template                              |
 | POST   | `/templates/{id}/preview?tenant_id=` | Render a template against candidate variables |
+| POST   | `/suppressions`              | Suppress an address, so nothing is sent to it  |
+| GET    | `/suppressions?tenant_id=`   | List a tenant's suppressed addresses           |
+| GET    | `/suppressions/lookup?channel=&address=` | Whether one address is suppressed  |
+| DELETE | `/suppressions?channel=&address=` | Lift a suppression                        |
 | POST   | `/api-keys`                  | Mint an API key for the caller's tenant (admin) |
 | GET    | `/api-keys`                  | List the caller's tenant's keys (admin)        |
 | DELETE | `/api-keys/{id}`             | Revoke a key (admin)                           |
@@ -72,7 +79,8 @@ missing or unusable credential, `403` for a valid key that isn't allowed to
 do this, `404` for unknown ids, `409` for an illegal status transition (e.g.
 cancelling a notification that's already `Sending`) or a template id that
 already exists, `422` for a recipient missing an address for the requested
-channel or a template missing the variables it needs.
+channel, a template missing the variables it needs, or a submission to a
+suppressed address.
 
 ## Authentication and tenancy
 
@@ -142,6 +150,82 @@ let worker = Worker::new(storage, channels, rate_limiter, breaker)
     .with_metrics(metrics);
 ```
 
+## Delivery history
+
+A notification's row carries a status and an attempt count, which between
+them explain nothing about *why* something dead-lettered. Every dispatch
+therefore appends a line to an append-only attempt log:
+
+```sh
+curl localhost:8080/notifications/$ID/attempts -H "Authorization: Bearer $K"
+```
+
+```json
+[
+  {"attempt_number": 1, "result": "skipped",   "reached_provider": false,
+   "error": "rate limit exhausted for email",  "duration_ms": null},
+  {"attempt_number": 1, "result": "failed",    "reached_provider": true,
+   "error": "550 mailbox full",                "duration_ms": 214},
+  {"attempt_number": 2, "result": "delivered", "reached_provider": true,
+   "error": null,                              "duration_ms": 187}
+]
+```
+
+`skipped` means nothing reached a provider -- an open circuit breaker, an
+exhausted rate limit, an unrenderable template, a recipient with no
+address for the channel -- and is kept distinct from `failed` because a
+skip says nothing about the provider's health. A skip doesn't spend an
+attempt, which is why consecutive skips share an `attempt_number`.
+
+`GET /attempts` answers the other question, across a whole tenant: what is
+failing right now.
+
+The worker writes these only if given somewhere to write them, and a
+failure to record one never fails the delivery it describes:
+
+```rust
+let worker = Worker::new(storage.clone(), channels, rate_limiter, breaker)
+    .with_attempt_log(Arc::new(storage));
+```
+
+This is the one table where a single notification writes many rows and
+nothing ever removes one, so it is the one table with a retention job:
+
+```sh
+ns queue purge-attempts --older-than-days 30
+```
+
+## Suppression list
+
+An address on a tenant's suppression list is never sent to:
+
+```sh
+curl -X POST localhost:8080/suppressions -H 'content-type: application/json' \
+     -H "Authorization: Bearer $K" \
+     -d '{"channel": "email", "address": "ada@example.com", "reason": "unsubscribed"}'
+```
+
+Reasons are `unsubscribed`, `bounced`, `complaint` and `manual`, recorded
+because they carry different weight -- stale `bounced` entries can safely
+be revisited, `unsubscribed` and `complaint` ones must not be.
+
+Suppression is keyed by **address**, not by recipient: the same inbox may
+be registered under several recipient ids, one per integration that ever
+imported it, and a suppression hanging off a recipient would be quietly
+undone by the next import. It is also **per-channel**, because an address
+belongs to exactly one -- "stop emailing me" is not "stop sending me
+one-time passcodes". Email addresses match case-insensitively, since
+suppression is the one place where matching too much is the safe failure.
+
+The list is enforced twice. Submitting to a suppressed address is refused
+with a `422` while the caller is still on the line; the worker checks
+again before every send, because an address can be suppressed after a
+notification is queued and that unsubscribe has to catch the batch already
+waiting behind a backoff delay. A notification stopped that way ends in
+the terminal `suppressed` status -- not `dead_lettered`, which is
+replayable, and replaying it would send to the address that asked not to
+be sent to.
+
 ## Templates
 
 Rather than inlining message text into every notification, store it once
@@ -182,8 +266,13 @@ ns recipient add --tenant $T --email ada@example.com --display-name "Ada Lovelac
 ns notification submit --tenant $T --recipient $R --channel email \
     --template order_shipped --var name=Ada --var order_id=1234
 ns notification list --tenant $T --status dead_lettered
+ns notification attempts $N       # why did this one dead-letter?
 ns queue due                      # what the next worker poll would claim
 ns queue replay --tenant $T       # re-queue dead-lettered work
+ns queue purge-attempts --older-than-days 30
+ns suppression add --tenant $T --channel email ada@example.com --reason complaint
+ns suppression check --tenant $T --channel email ada@example.com
+ns suppression remove --tenant $T --channel email ada@example.com
 ns template render --tenant $T order_shipped --var name=Ada
 ```
 
@@ -203,10 +292,16 @@ let channels = ChannelRegistry::new()
 let rate_limiter = RateLimiter::new().with_limit(ChannelKind::Webhook, 50, 10.0);
 let circuit_breaker = CircuitBreaker::new(5, chrono::Duration::seconds(30));
 
-let worker = Worker::new(storage, channels, rate_limiter, circuit_breaker);
+let worker = Worker::new(storage.clone(), channels, rate_limiter, circuit_breaker)
+    .with_attempt_log(Arc::new(storage));
 let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 worker.run(settings.queue.batch_size, poll_interval, shutdown_rx).await?;
 ```
+
+The storage handed to `Worker::new` must implement `SuppressionRepository`
+as well, so a deployment can't come up without the suppression list
+wired; the attempt log is opt-in by comparison, because a worker that
+records nothing still delivers correctly.
 
 Register only the channels a deployment has credentials for --
 `ns_worker::WorkerError::UnregisteredChannel` fails (and retries) any
