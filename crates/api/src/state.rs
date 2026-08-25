@@ -4,7 +4,7 @@ use ns_metrics::ServiceMetrics;
 use ns_queue::NotificationQueue;
 use ns_storage::{
     ApiKeyRepository, DeliveryAttemptRepository, NotificationRepository, RecipientRepository,
-    TemplateRepository,
+    SuppressionRepository, TemplateRepository,
 };
 
 use crate::auth::AuthMode;
@@ -27,6 +27,7 @@ pub trait Repositories:
     + TemplateRepository
     + ApiKeyRepository
     + DeliveryAttemptRepository
+    + SuppressionRepository
     + Clone
     + Send
     + Sync
@@ -40,6 +41,7 @@ impl<R> Repositories for R where
         + TemplateRepository
         + ApiKeyRepository
         + DeliveryAttemptRepository
+        + SuppressionRepository
         + Clone
         + Send
         + Sync

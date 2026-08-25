@@ -189,6 +189,22 @@ where
         return Err(ApiError::NotFound(format!("recipient {} not found", request.recipient_id)));
     }
 
+    // Checked here as well as in the worker, and for the reason every
+    // other up-front check in this handler exists: a notification that can
+    // never be delivered should be refused while the caller is still on
+    // the line. The worker's check is still the authoritative one, since
+    // an address can be suppressed after this point and before the send.
+    //
+    // Only when the recipient actually has an address for this channel --
+    // if it doesn't, that is a separate problem the worker already
+    // reports, and inventing an address to test would answer the wrong
+    // question.
+    if let Ok(address) = recipient.address_for(request.channel) {
+        if let Some(suppression) = state.repo.find_suppression(tenant_id, address).await? {
+            return Err(ApiError::Suppressed { reason: suppression.reason });
+        }
+    }
+
     let mut builder =
         Notification::builder(tenant_id, request.recipient_id, request.channel).priority(request.priority);
     if let Some(subject) = request.subject {

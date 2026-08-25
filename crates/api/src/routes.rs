@@ -10,6 +10,7 @@ pub mod api_keys;
 mod health;
 pub mod notifications;
 pub mod recipients;
+pub mod suppressions;
 pub mod templates;
 
 /// Builds the full route table over a generic repository, mirroring
@@ -51,6 +52,13 @@ where
             get(templates::get_template).put(templates::update_template).delete(templates::delete_template),
         )
         .route("/templates/{id}/preview", post(templates::preview_template))
+        .route(
+            "/suppressions",
+            post(suppressions::create_suppression)
+                .get(suppressions::list_suppressions)
+                .delete(suppressions::delete_suppression),
+        )
+        .route("/suppressions/lookup", get(suppressions::get_suppression))
         .route("/api-keys", post(api_keys::create_api_key).get(api_keys::list_api_keys))
         .route("/api-keys/{id}", axum::routing::delete(api_keys::revoke_api_key))
         // route_layer, so a request for an unknown path is a plain 404

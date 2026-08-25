@@ -36,6 +36,16 @@ pub enum ApiError {
     #[error("{0}")]
     BadRequest(String),
 
+    /// The recipient's address for this channel is on the tenant's
+    /// suppression list.
+    ///
+    /// 422 rather than 403: the request was well-formed, understood, and
+    /// the caller is perfectly entitled to make it -- the service just
+    /// won't act on it. That matches how a recipient missing an address
+    /// for its channel is reported, which is the same shape of problem.
+    #[error("recipient's {reason} address is suppressed for this tenant")]
+    Suppressed { reason: ns_core::SuppressionReason },
+
     #[error(transparent)]
     Auth(#[from] AuthError),
 
@@ -148,6 +158,7 @@ impl IntoResponse for ApiError {
             ApiError::Template(err) => status_for_template(err),
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
+            ApiError::Suppressed { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             ApiError::Auth(err) => status_for_auth(err),
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
