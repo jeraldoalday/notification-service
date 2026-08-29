@@ -1,10 +1,45 @@
 use chrono::{DateTime, Utc};
 use ns_core::{DeliveryStatus, Notification};
-use ns_storage::NotificationRepository;
+use ns_storage::{NotificationRepository, StorageError};
 use uuid::Uuid;
 
 use crate::backoff;
 use crate::error::{QueueError, QueueResult};
+
+/// What an idempotent submission did.
+///
+/// Two variants rather than a bare `Notification` plus a bool, because
+/// the caller almost always has to act on the difference: an HTTP API
+/// answers 201 for one and 200 for the other, a CLI says "queued" or
+/// "already queued", and a metric counts them apart. A bool alongside the
+/// value is the same information in a shape that is easier to ignore.
+#[derive(Debug, Clone)]
+pub enum Submission {
+    /// Nothing had used this key, so the notification is now on the queue.
+    Created(Notification),
+    /// The key had already been used, and this is the notification it
+    /// created. Nothing was queued by this call and nothing extra will be
+    /// sent -- which is the entire point.
+    Duplicate(Notification),
+}
+
+impl Submission {
+    pub fn notification(&self) -> &Notification {
+        match self {
+            Submission::Created(notification) | Submission::Duplicate(notification) => notification,
+        }
+    }
+
+    pub fn into_notification(self) -> Notification {
+        match self {
+            Submission::Created(notification) | Submission::Duplicate(notification) => notification,
+        }
+    }
+
+    pub fn is_duplicate(&self) -> bool {
+        matches!(self, Submission::Duplicate(_))
+    }
+}
 
 /// Durable job queue built on top of a `NotificationRepository`: submitting
 /// new work, claiming due work for processing without double-dispatching
@@ -31,6 +66,58 @@ impl<R: NotificationRepository> NotificationQueue<R> {
         notification.transition(DeliveryStatus::Queued, now)?;
         self.repo.insert_notification(&notification).await?;
         Ok(notification)
+    }
+
+    /// Submits a notification, honouring its idempotency key if it has
+    /// one.
+    ///
+    /// A notification with no key is submitted exactly as `submit` would:
+    /// the caller did not ask for deduplication and does not pay for a
+    /// lookup it never wanted.
+    ///
+    /// With a key, the flow is look-then-insert, and the insert is the
+    /// authority. The lookup is the common path -- a retry usually arrives
+    /// long after the original, and answering it with one indexed read
+    /// beats provoking a constraint violation. But two of a client's own
+    /// retries can also arrive concurrently, which is exactly the
+    /// situation retries exist for, and then both lookups miss and both
+    /// inserts run. The unique index refuses the second, and the loser
+    /// reads the winner's notification back rather than failing: from the
+    /// client's side, two racing retries of one request must not be
+    /// distinguishable from two sequential ones.
+    pub async fn submit_idempotent(
+        &self,
+        notification: Notification,
+        now: DateTime<Utc>,
+    ) -> QueueResult<Submission> {
+        let Some(key) = notification.idempotency_key.clone() else {
+            return Ok(Submission::Created(self.submit(notification, now).await?));
+        };
+        let tenant_id = notification.tenant_id;
+
+        if let Some(existing) = self.repo.find_by_idempotency_key(tenant_id, &key).await? {
+            return Ok(Submission::Duplicate(existing));
+        }
+
+        match self.submit(notification, now).await {
+            Ok(submitted) => Ok(Submission::Created(submitted)),
+            Err(QueueError::Storage(StorageError::DuplicateIdempotencyKey { .. })) => {
+                match self.repo.find_by_idempotency_key(tenant_id, &key).await? {
+                    Some(existing) => Ok(Submission::Duplicate(existing)),
+                    // The index says the key is taken and the lookup says
+                    // it isn't. Nothing in this service deletes
+                    // notifications, so this is not a state it can reach
+                    // on its own -- reporting the constraint violation is
+                    // better than pretending to a caller that its message
+                    // was queued when no row for it exists.
+                    None => Err(QueueError::Storage(StorageError::DuplicateIdempotencyKey {
+                        tenant_id,
+                        key: key.to_string(),
+                    })),
+                }
+            }
+            Err(err) => Err(err),
+        }
     }
 
     /// Claims up to `limit` due notifications for processing, moving each
@@ -151,6 +238,11 @@ impl<R: NotificationRepository> NotificationQueue<R> {
     /// Only dead-lettered notifications can be replayed: replaying
     /// something that was cancelled would undo a deliberate decision, and
     /// replaying live work would double-send it.
+    ///
+    /// The copy carries no idempotency key. That key named the caller's
+    /// submission; a replay is the operator's decision to send the
+    /// message again, which is the one thing an idempotency key exists to
+    /// prevent happening by accident.
     pub async fn replay(&self, notification: &Notification, now: DateTime<Utc>) -> QueueResult<Notification> {
         if notification.status != DeliveryStatus::DeadLettered {
             return Err(QueueError::NotReplayable { id: notification.id, status: notification.status });
@@ -163,6 +255,14 @@ impl<R: NotificationRepository> NotificationQueue<R> {
         replayed.scheduled_for = None;
         replayed.created_at = now;
         replayed.updated_at = now;
+        // The key named the *caller's* submission, and this is not one:
+        // an operator replaying dead-lettered work is deliberately asking
+        // for the message to go out again. Carrying the key over would
+        // collide with the original on the unique index and fail the
+        // replay outright -- and if it somehow didn't, it would leave two
+        // rows answering to a key that is supposed to identify exactly
+        // one.
+        replayed.idempotency_key = None;
 
         self.submit(replayed, now).await
     }
@@ -207,6 +307,143 @@ mod tests {
             .max_attempts(2)
             .build()
             .unwrap()
+    }
+
+    fn keyed_notification(tenant_id: Uuid, key: &str) -> Notification {
+        Notification::builder(tenant_id, Uuid::new_v4(), ChannelKind::Email)
+            .body("Hello there")
+            .max_attempts(2)
+            .idempotency_key(ns_core::IdempotencyKey::new(key).unwrap())
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn an_unkeyed_submission_is_never_deduplicated() {
+        let (queue, _dir) = test_queue().await;
+
+        let first = queue.submit_idempotent(sample_notification(), Utc::now()).await.unwrap();
+        let second = queue.submit_idempotent(sample_notification(), Utc::now()).await.unwrap();
+
+        assert!(!first.is_duplicate());
+        assert!(!second.is_duplicate(), "no key means no claim that these are the same message");
+        assert_ne!(first.notification().id, second.notification().id);
+    }
+
+    #[tokio::test]
+    async fn a_first_keyed_submission_is_queued_normally() {
+        let (queue, _dir) = test_queue().await;
+
+        let submission = queue.submit_idempotent(keyed_notification(Uuid::new_v4(), "k1"), Utc::now()).await;
+
+        let submission = submission.unwrap();
+        assert!(!submission.is_duplicate());
+        assert_eq!(submission.notification().status, DeliveryStatus::Queued);
+    }
+
+    #[tokio::test]
+    async fn a_retry_resolves_to_the_notification_the_first_attempt_created() {
+        let (queue, _dir) = test_queue().await;
+        let tenant_id = Uuid::new_v4();
+        let first =
+            queue.submit_idempotent(keyed_notification(tenant_id, "order-1041"), Utc::now()).await.unwrap();
+
+        let retry =
+            queue.submit_idempotent(keyed_notification(tenant_id, "order-1041"), Utc::now()).await.unwrap();
+
+        assert!(retry.is_duplicate());
+        assert_eq!(retry.notification().id, first.notification().id);
+    }
+
+    #[tokio::test]
+    async fn a_deduplicated_retry_queues_nothing_extra() {
+        let (queue, _dir) = test_queue().await;
+        let tenant_id = Uuid::new_v4();
+        queue.submit_idempotent(keyed_notification(tenant_id, "order-1041"), Utc::now()).await.unwrap();
+        queue.submit_idempotent(keyed_notification(tenant_id, "order-1041"), Utc::now()).await.unwrap();
+
+        // The whole point: one message reaches the recipient, not two.
+        let claimed = queue.claim_batch(Utc::now(), 10).await.unwrap();
+        assert_eq!(claimed.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_key_deduplicates_only_within_its_own_tenant() {
+        let (queue, _dir) = test_queue().await;
+        let mine = queue.submit_idempotent(keyed_notification(Uuid::new_v4(), "k1"), Utc::now()).await;
+        let theirs = queue.submit_idempotent(keyed_notification(Uuid::new_v4(), "k1"), Utc::now()).await;
+
+        assert!(!mine.unwrap().is_duplicate());
+        assert!(!theirs.unwrap().is_duplicate(), "two tenants picking the same string is a coincidence");
+    }
+
+    #[tokio::test]
+    async fn a_retry_arriving_after_delivery_still_deduplicates() {
+        let (queue, _dir) = test_queue().await;
+        let tenant_id = Uuid::new_v4();
+        let first =
+            queue.submit_idempotent(keyed_notification(tenant_id, "order-1041"), Utc::now()).await.unwrap();
+        let claimed = queue.claim_batch(Utc::now(), 10).await.unwrap().remove(0);
+        queue.complete(claimed, Utc::now()).await.unwrap();
+
+        // A client that never saw the response retries whenever it comes
+        // back up, which may be long after the message went out.
+        let retry =
+            queue.submit_idempotent(keyed_notification(tenant_id, "order-1041"), Utc::now()).await.unwrap();
+
+        assert!(retry.is_duplicate());
+        assert_eq!(retry.notification().id, first.notification().id);
+        assert_eq!(retry.notification().status, DeliveryStatus::Delivered, "and reports what became of it");
+    }
+
+    #[tokio::test]
+    async fn concurrent_retries_of_one_request_send_once() {
+        let (queue, _dir) = test_queue().await;
+        let tenant_id = Uuid::new_v4();
+        let now = Utc::now();
+
+        // Both lookups miss, both inserts run, and the unique index
+        // decides. Two racing retries must not be distinguishable, from
+        // the client's side, from two sequential ones.
+        let (first, second) = tokio::join!(
+            queue.submit_idempotent(keyed_notification(tenant_id, "order-1041"), now),
+            queue.submit_idempotent(keyed_notification(tenant_id, "order-1041"), now),
+        );
+
+        let (first, second) = (first.unwrap(), second.unwrap());
+        assert_eq!(first.notification().id, second.notification().id, "one notification, two answers");
+        assert!(first.is_duplicate() ^ second.is_duplicate(), "exactly one call created it");
+        assert_eq!(queue.claim_batch(now, 10).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn replaying_keyed_work_drops_the_key() {
+        let (queue, _dir) = test_queue().await;
+        let tenant_id = Uuid::new_v4();
+        let dead = dead_letter_keyed(&queue, tenant_id, "order-1041").await;
+        assert!(dead.idempotency_key.is_some(), "the original kept the key it was submitted under");
+
+        let replayed = queue.replay(&dead, Utc::now()).await.unwrap();
+
+        // A replay is the operator deciding to send again, which is the
+        // one thing the key exists to stop happening by accident -- and
+        // carrying it over would collide on the unique index besides.
+        assert_eq!(replayed.idempotency_key, None);
+        assert_eq!(replayed.status, DeliveryStatus::Queued);
+    }
+
+    #[tokio::test]
+    async fn a_replayed_notification_can_be_replayed_again() {
+        let (queue, _dir) = test_queue().await;
+        let tenant_id = Uuid::new_v4();
+        let dead = dead_letter_keyed(&queue, tenant_id, "order-1041").await;
+
+        queue.replay(&dead, Utc::now()).await.unwrap();
+        // Replaying the same dead-lettered original twice would trip the
+        // unique index if the key travelled with the copies.
+        queue.replay(&dead, Utc::now()).await.unwrap();
+
+        assert_eq!(queue.claim_batch(Utc::now(), 10).await.unwrap().len(), 2);
     }
 
     #[tokio::test]
@@ -355,6 +592,30 @@ mod tests {
             }
             // The retry was scheduled behind a backoff delay; clear it so
             // the next claim_batch picks it straight back up.
+            current.scheduled_for = None;
+            queue.repo.update_notification(&current).await.unwrap();
+        }
+    }
+
+    /// The same, for a notification submitted under an idempotency key.
+    async fn dead_letter_keyed(
+        queue: &NotificationQueue<SqliteStorage>,
+        tenant_id: Uuid,
+        key: &str,
+    ) -> Notification {
+        let submitted = queue
+            .submit_idempotent(keyed_notification(tenant_id, key), Utc::now())
+            .await
+            .unwrap()
+            .into_notification();
+        let mut current = submitted;
+        loop {
+            let claimed = queue.claim_batch(Utc::now(), 10).await.unwrap();
+            let claimed = claimed.into_iter().find(|n| n.id == current.id).expect("claimable");
+            current = queue.fail(claimed, Utc::now()).await.unwrap();
+            if current.status == DeliveryStatus::DeadLettered {
+                return current;
+            }
             current.scheduled_for = None;
             queue.repo.update_notification(&current).await.unwrap();
         }
