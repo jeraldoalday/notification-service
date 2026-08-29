@@ -46,6 +46,16 @@ pub enum ApiError {
     #[error("recipient's {reason} address is suppressed for this tenant")]
     Suppressed { reason: ns_core::SuppressionReason },
 
+    /// The caller reused an idempotency key for a different message.
+    ///
+    /// 409 rather than 200-with-the-original: the two requests disagree
+    /// about what should be sent, and answering with the first one would
+    /// drop the second message without anything ever reporting a failure.
+    /// A key derived from something less unique than the caller thought is
+    /// a bug in the caller, and it is only ever discoverable here.
+    #[error("idempotency key `{key}` was already used for a different notification")]
+    IdempotencyConflict { key: String },
+
     #[error(transparent)]
     Auth(#[from] AuthError),
 
@@ -115,7 +125,11 @@ fn status_for_template(err: &TemplateError) -> StatusCode {
 fn status_for_storage(err: &StorageError) -> StatusCode {
     match err {
         StorageError::TemplateNotFound { .. } => StatusCode::NOT_FOUND,
-        StorageError::TemplateAlreadyExists { .. } => StatusCode::CONFLICT,
+        StorageError::TemplateAlreadyExists { .. }
+        // Only reachable if the winner of a keyed race has since
+        // vanished, which nothing in this service does -- but it is still
+        // a collision on a key the caller chose, not a server fault.
+        | StorageError::DuplicateIdempotencyKey { .. } => StatusCode::CONFLICT,
         StorageError::NotificationNotFound(_)
         | StorageError::RecipientNotFound(_)
         | StorageError::ApiKeyNotFound(_) => StatusCode::NOT_FOUND,
@@ -159,6 +173,7 @@ impl IntoResponse for ApiError {
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
             ApiError::Suppressed { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+            ApiError::IdempotencyConflict { .. } => StatusCode::CONFLICT,
             ApiError::Auth(err) => status_for_auth(err),
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };

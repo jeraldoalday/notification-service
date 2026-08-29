@@ -1,11 +1,17 @@
 use std::collections::HashMap;
 
 use axum::extract::{Path, Query, State};
+use axum::http::header::{HeaderMap, HeaderName, HeaderValue};
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::Json;
 use chrono::{DateTime, Utc};
 use ns_auth::Scope;
-use ns_core::{AttemptResult, ChannelKind, DeliveryAttempt, DeliveryStatus, Notification, Priority};
+use ns_core::{
+    AttemptResult, ChannelKind, DeliveryAttempt, DeliveryStatus, IdempotencyKey, Notification, Priority,
+};
+use ns_metrics::ServiceMetrics;
+use ns_queue::Submission;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -49,6 +55,22 @@ const MAX_LIST_LIMIT: u32 = 500;
 /// counted.
 const DEFAULT_ATTEMPT_LIMIT: u32 = 100;
 const MAX_ATTEMPT_LIMIT: u32 = 1000;
+
+/// Where a caller names its submission. A header rather than a body
+/// field, matching the convention every client library already
+/// implements: it belongs to the request rather than to the notification,
+/// and a client that retries by replaying a buffered request keeps it for
+/// free.
+const IDEMPOTENCY_KEY_HEADER: HeaderName = HeaderName::from_static("idempotency-key");
+
+/// Set on a response the service answered from an existing notification
+/// rather than by queueing a new one.
+///
+/// The status code already says it -- 200 where a fresh submission
+/// answers 201 -- but a client that treats every 2xx alike would miss
+/// that, and "did my retry actually send a second message?" is a question
+/// worth being able to answer from a log of response headers alone.
+const IDEMPOTENT_REPLAY_HEADER: HeaderName = HeaderName::from_static("idempotent-replay");
 
 #[derive(Debug, Deserialize)]
 pub struct ListAttemptsQuery {
@@ -127,6 +149,11 @@ pub struct NotificationResponse {
     pub priority: Priority,
     pub status: DeliveryStatus,
     pub subject: Option<String>,
+    /// Echoed back so a caller can confirm the key it sent is the key the
+    /// service stored, and so the notification a later lookup returns
+    /// carries the name the caller knows it by.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<IdempotencyKey>,
     pub attempt_count: u32,
     pub max_attempts: u32,
     pub created_at: DateTime<Utc>,
@@ -144,6 +171,7 @@ impl From<Notification> for NotificationResponse {
             priority: n.priority,
             status: n.status,
             subject: n.subject,
+            idempotency_key: n.idempotency_key,
             attempt_count: n.attempt_count,
             max_attempts: n.max_attempts,
             created_at: n.created_at,
@@ -153,30 +181,130 @@ impl From<Notification> for NotificationResponse {
     }
 }
 
+/// Reads the `Idempotency-Key` header, if the caller sent one.
+///
+/// A malformed key is refused rather than ignored. Ignoring it would send
+/// the message and answer 201, and the caller -- believing it had asked
+/// for deduplication -- would send it again on its next retry.
+fn idempotency_key(headers: &HeaderMap) -> ApiResult<Option<IdempotencyKey>> {
+    let Some(value) = headers.get(IDEMPOTENCY_KEY_HEADER) else {
+        return Ok(None);
+    };
+    let value =
+        value.to_str().map_err(|_| ApiError::BadRequest("Idempotency-Key must be printable ASCII".into()))?;
+    Ok(Some(IdempotencyKey::new(value)?))
+}
+
+/// Builds the notification a request is asking for.
+///
+/// Pure: it touches no storage, so the caller can build the notification a
+/// request describes before deciding whether anything needs to be
+/// submitted at all. That ordering is what lets a repeated submission be
+/// answered without re-running the checks the first one passed.
+fn build_notification(
+    request: &SubmitNotificationRequest,
+    tenant_id: Uuid,
+    key: Option<IdempotencyKey>,
+) -> ApiResult<Notification> {
+    let mut builder =
+        Notification::builder(tenant_id, request.recipient_id, request.channel).priority(request.priority);
+    if let Some(subject) = &request.subject {
+        builder = builder.subject(subject.clone());
+    }
+    if let Some(body) = &request.body {
+        builder = builder.body(body.clone());
+    }
+    if let Some(template_id) = &request.template_id {
+        builder = builder.template(template_id.clone());
+    }
+    for (name, value) in &request.template_vars {
+        builder = builder.template_var(name.clone(), value.clone());
+    }
+    if let Some(key) = key {
+        builder = builder.idempotency_key(key);
+    }
+    if let Some(max_attempts) = request.max_attempts {
+        builder = builder.max_attempts(max_attempts);
+    }
+    if let Some(scheduled_for) = request.scheduled_for {
+        builder = builder.scheduled_for(scheduled_for);
+    }
+    Ok(builder.build()?)
+}
+
+/// Answers a submission whose idempotency key has already been used.
+///
+/// The comparison is the reason this isn't just "return the existing
+/// row". A caller retrying its own request presents the same content, and
+/// gets the notification its first attempt created. A caller reusing a
+/// key for a *different* message has made a mistake -- most often a key
+/// derived from something less unique than it looked -- and gets a 409,
+/// because answering with the first notification would silently drop the
+/// second message with nothing anywhere reporting a failure.
+fn idempotent_replay(
+    metrics: &ServiceMetrics,
+    existing: Notification,
+    candidate: &Notification,
+) -> ApiResult<Response> {
+    if !existing.has_same_content_as(candidate) {
+        return Err(ApiError::IdempotencyConflict {
+            key: candidate.idempotency_key.as_ref().map(IdempotencyKey::to_string).unwrap_or_default(),
+        });
+    }
+
+    metrics.record_deduplicated(existing.channel);
+    let mut response = (StatusCode::OK, Json(NotificationResponse::from(existing))).into_response();
+    response.headers_mut().insert(IDEMPOTENT_REPLAY_HEADER, HeaderValue::from_static("true"));
+    Ok(response)
+}
+
 /// Submits a notification for delivery.
 ///
-/// Both up-front checks exist for the same reason: a notification that
-/// can never be delivered should be rejected here, synchronously, rather
-/// than being accepted, retried on backoff until its attempts run out and
+/// Answers 201 with the queued notification, or 200 with an existing one
+/// when an `Idempotency-Key` names a submission this tenant has already
+/// made.
+///
+/// The up-front checks exist for one reason: a notification that can
+/// never be delivered should be rejected here, synchronously, rather than
+/// being accepted, retried on backoff until its attempts run out and
 /// dead-lettered minutes later where nobody is watching. So an unknown
-/// recipient is a 404, and a `template_id` is resolved and test-rendered
-/// against the supplied `template_vars` before the notification is
-/// queued.
+/// recipient is a 404, a suppressed address is a 422, and a `template_id`
+/// is resolved and test-rendered against the supplied `template_vars`
+/// before the notification is queued.
 ///
 /// The rendered text is deliberately thrown away rather than stored on
 /// the notification: `ns-worker` renders again at send time, so an edit to
 /// the template still reaches everything queued behind it. This is purely
 /// a validity check.
+///
+/// A submission resolved by its idempotency key skips all of it. Those
+/// checks describe the message that was already accepted, and re-running
+/// them would let a retry fail over a recipient deleted or an address
+/// suppressed since -- turning the one call that exists to make retrying
+/// safe into the one call that punishes it.
 pub async fn submit_notification<R>(
     State(state): State<AppState<R>>,
     caller: Caller,
+    headers: HeaderMap,
     ApiJson(request): ApiJson<SubmitNotificationRequest>,
-) -> ApiResult<(StatusCode, Json<NotificationResponse>)>
+) -> ApiResult<Response>
 where
     R: Repositories,
 {
     caller.require(Scope::Write)?;
     let tenant_id = caller.tenant_for(request.tenant_id)?;
+    let key = idempotency_key(&headers)?;
+
+    // Built before anything is looked up, because the lookup below needs
+    // something to compare against. A request that doesn't describe a
+    // valid notification is still a 400 either way.
+    let candidate = build_notification(&request, tenant_id, key.clone())?;
+
+    if let Some(key) = &key {
+        if let Some(existing) = state.repo.find_by_idempotency_key(tenant_id, key).await? {
+            return idempotent_replay(&state.metrics, existing, &candidate);
+        }
+    }
 
     // Fail fast with a 404 rather than letting a bad recipient_id surface
     // only once the worker tries (and fails) to dispatch the notification.
@@ -205,41 +333,31 @@ where
         }
     }
 
-    let mut builder =
-        Notification::builder(tenant_id, request.recipient_id, request.channel).priority(request.priority);
-    if let Some(subject) = request.subject {
-        builder = builder.subject(subject);
-    }
-    if let Some(body) = request.body {
-        builder = builder.body(body);
-    }
-    if let Some(template_id) = request.template_id {
-        builder = builder.template(template_id);
-    }
-    for (key, value) in request.template_vars {
-        builder = builder.template_var(key, value);
-    }
-    if let Some(max_attempts) = request.max_attempts {
-        builder = builder.max_attempts(max_attempts);
-    }
-    if let Some(scheduled_for) = request.scheduled_for {
-        builder = builder.scheduled_for(scheduled_for);
+    if let Some(template_id) = &candidate.template_id {
+        let template = state.repo.get_template(candidate.tenant_id, template_id).await?;
+        template.render_for(&candidate)?;
     }
 
-    let notification = builder.build()?;
-
-    if let Some(template_id) = &notification.template_id {
-        let template = state.repo.get_template(notification.tenant_id, template_id).await?;
-        template.render_for(&notification)?;
+    // Cloned so the candidate survives to be compared against whatever
+    // the queue reports back. Only a keyed submission can come back as a
+    // duplicate, but the clone is a handful of strings next to the writes
+    // on either side of it.
+    match state.queue.submit_idempotent(candidate.clone(), Utc::now()).await? {
+        Submission::Created(submitted) => {
+            // Counted here rather than inside NotificationQueue::submit so
+            // the number means "accepted from a caller", not "written to
+            // storage" -- the queue's own submit is also what replay uses
+            // to re-enqueue work that was already counted once.
+            state.metrics.record_submitted(submitted.channel);
+            Ok((StatusCode::CREATED, Json(NotificationResponse::from(submitted))).into_response())
+        }
+        // The lookup above missed and the insert still collided, so a
+        // concurrent retry of this same request won the race. Answered
+        // exactly as the sequential case is: two retries arriving at once
+        // must not be distinguishable, from the client's side, from two
+        // arriving in order.
+        Submission::Duplicate(existing) => idempotent_replay(&state.metrics, existing, &candidate),
     }
-
-    let submitted = state.queue.submit(notification, Utc::now()).await?;
-    // Counted here rather than inside NotificationQueue::submit so the
-    // number means "accepted from a caller", not "written to storage" --
-    // the queue's own submit is also what replay uses to re-enqueue work
-    // that was already counted once.
-    state.metrics.record_submitted(submitted.channel);
-    Ok((StatusCode::CREATED, Json(submitted.into())))
 }
 
 pub async fn get_notification<R>(
