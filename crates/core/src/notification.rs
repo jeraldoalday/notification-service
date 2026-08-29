@@ -5,6 +5,7 @@ use uuid::Uuid;
 
 use crate::channel::ChannelKind;
 use crate::error::{CoreError, CoreResult};
+use crate::idempotency::IdempotencyKey;
 use crate::priority::Priority;
 use crate::status::DeliveryStatus;
 
@@ -39,6 +40,14 @@ pub struct Notification {
     pub body: String,
     pub template_id: Option<String>,
     pub template_vars: HashMap<String, String>,
+    /// The caller's name for this submission, if it gave one.
+    ///
+    /// `default` on the way in and skipped on the way out, because a
+    /// notification is stored as a JSON document: rows written before
+    /// this field existed have to keep deserializing, and the ones
+    /// written without a key shouldn't grow a `null` for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<IdempotencyKey>,
     pub attempt_count: u32,
     pub max_attempts: u32,
     pub created_at: DateTime<Utc>,
@@ -67,6 +76,36 @@ impl Notification {
         self.attempt_count < self.max_attempts
     }
 
+    /// Whether `other` asks for the same message to be sent as this one.
+    ///
+    /// This is the comparison an idempotent submission needs: a caller
+    /// retrying a request presents the same key *and* the same content, so
+    /// the key can be honoured. A caller reusing a key for a different
+    /// message has made a mistake -- most often a key derived from
+    /// something less unique than it looked -- and must be told, because
+    /// silently returning the first notification would drop the second
+    /// message entirely without anything ever reporting a failure.
+    ///
+    /// Compared field by field rather than through a stored hash of the
+    /// request body: the fields below are what the service will actually
+    /// act on, whereas two request bodies can differ in key order or
+    /// whitespace while asking for exactly the same thing. Identity,
+    /// timestamps, status and attempt bookkeeping are deliberately not
+    /// compared -- they describe this notification's own history, not what
+    /// the caller asked for.
+    pub fn has_same_content_as(&self, other: &Notification) -> bool {
+        self.tenant_id == other.tenant_id
+            && self.recipient_id == other.recipient_id
+            && self.channel == other.channel
+            && self.priority == other.priority
+            && self.subject == other.subject
+            && self.body == other.body
+            && self.template_id == other.template_id
+            && self.template_vars == other.template_vars
+            && self.max_attempts == other.max_attempts
+            && self.scheduled_for == other.scheduled_for
+    }
+
     pub fn record_attempt(&mut self, now: DateTime<Utc>) {
         // Saturating rather than wrapping: `build` bounds `max_attempts`,
         // so this can't be reached in practice, but a count that wrapped
@@ -92,6 +131,7 @@ pub struct NotificationBuilder {
     body: Option<String>,
     template_id: Option<String>,
     template_vars: HashMap<String, String>,
+    idempotency_key: Option<IdempotencyKey>,
     max_attempts: u32,
     scheduled_for: Option<DateTime<Utc>>,
 }
@@ -107,6 +147,7 @@ impl NotificationBuilder {
             body: None,
             template_id: None,
             template_vars: HashMap::new(),
+            idempotency_key: None,
             max_attempts: 5,
             scheduled_for: None,
         }
@@ -134,6 +175,13 @@ impl NotificationBuilder {
 
     pub fn template_var(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.template_vars.insert(key.into(), value.into());
+        self
+    }
+
+    /// Names this submission, so a retry carrying the same key resolves
+    /// to the notification this one creates rather than sending again.
+    pub fn idempotency_key(mut self, key: IdempotencyKey) -> Self {
+        self.idempotency_key = Some(key);
         self
     }
 
@@ -180,6 +228,7 @@ impl NotificationBuilder {
             body: self.body.unwrap_or_default(),
             template_id: self.template_id,
             template_vars: self.template_vars,
+            idempotency_key: self.idempotency_key,
             attempt_count: 0,
             max_attempts: self.max_attempts,
             created_at: now,
@@ -314,6 +363,114 @@ mod tests {
         assert!(n.has_attempts_remaining());
         n.record_attempt(Utc::now());
         assert!(!n.has_attempts_remaining());
+    }
+
+    #[test]
+    fn a_notification_carries_no_idempotency_key_unless_asked() {
+        let n = build_ok();
+        assert_eq!(n.idempotency_key, None);
+    }
+
+    #[test]
+    fn the_builder_carries_an_idempotency_key_through() {
+        let key = IdempotencyKey::new("order-1041").unwrap();
+        let n = Notification::builder(Uuid::new_v4(), Uuid::new_v4(), ChannelKind::Email)
+            .body("hi")
+            .idempotency_key(key.clone())
+            .build()
+            .unwrap();
+        assert_eq!(n.idempotency_key, Some(key));
+    }
+
+    #[test]
+    fn a_notification_stored_before_keys_existed_still_deserializes() {
+        // Notifications are stored as JSON documents, so the field has to
+        // be optional on the way in as well as on the way out.
+        let mut json = serde_json::to_value(build_ok()).unwrap();
+        assert!(json.get("idempotency_key").is_none(), "an absent key adds no field");
+
+        json.as_object_mut().unwrap().remove("subject");
+        let restored: Notification = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.idempotency_key, None);
+    }
+
+    #[test]
+    fn a_retry_of_the_same_request_compares_equal() {
+        let tenant = Uuid::new_v4();
+        let recipient = Uuid::new_v4();
+        let submit = || {
+            Notification::builder(tenant, recipient, ChannelKind::Email)
+                .subject("Welcome")
+                .body("Hello there")
+                .template_var("name", "Ada")
+                .build()
+                .unwrap()
+        };
+
+        let first = submit();
+        let second = submit();
+        assert_ne!(first.id, second.id, "two builds, two identities");
+        assert!(first.has_same_content_as(&second), "but the same message");
+    }
+
+    #[test]
+    fn a_different_message_does_not_compare_equal() {
+        let tenant = Uuid::new_v4();
+        let recipient = Uuid::new_v4();
+        let base = Notification::builder(tenant, recipient, ChannelKind::Email)
+            .subject("Welcome")
+            .body("Hello there")
+            .build()
+            .unwrap();
+
+        let variants = [
+            Notification::builder(tenant, recipient, ChannelKind::Email)
+                .subject("Welcome")
+                .body("Something else")
+                .build()
+                .unwrap(),
+            Notification::builder(tenant, recipient, ChannelKind::Sms)
+                .subject("Welcome")
+                .body("Hello there")
+                .build()
+                .unwrap(),
+            Notification::builder(tenant, Uuid::new_v4(), ChannelKind::Email)
+                .subject("Welcome")
+                .body("Hello there")
+                .build()
+                .unwrap(),
+            Notification::builder(tenant, recipient, ChannelKind::Email)
+                .subject("Welcome")
+                .body("Hello there")
+                .priority(Priority::Critical)
+                .build()
+                .unwrap(),
+            Notification::builder(tenant, recipient, ChannelKind::Email)
+                .subject("Welcome")
+                .body("Hello there")
+                .max_attempts(9)
+                .build()
+                .unwrap(),
+        ];
+        for variant in &variants {
+            assert!(!base.has_same_content_as(variant), "wrongly matched {variant:?}");
+        }
+    }
+
+    #[test]
+    fn content_comparison_ignores_a_notifications_own_history() {
+        // Only what the caller asked for is compared: a first submission
+        // that has since been claimed, retried and rescheduled still
+        // matches the retry that arrives after it.
+        let mut first = build_ok();
+        let second = first.clone();
+
+        first.transition(DeliveryStatus::Queued, Utc::now()).unwrap();
+        first.transition(DeliveryStatus::Sending, Utc::now()).unwrap();
+        first.record_attempt(Utc::now());
+        first.id = Uuid::new_v4();
+
+        assert!(first.has_same_content_as(&second));
     }
 
     #[test]

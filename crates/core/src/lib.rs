@@ -1,6 +1,7 @@
 pub mod attempt;
 pub mod channel;
 pub mod error;
+pub mod idempotency;
 pub mod notification;
 pub mod priority;
 pub mod recipient;
@@ -10,6 +11,7 @@ pub mod suppression;
 pub use attempt::{AttemptResult, DeliveryAttempt};
 pub use channel::{Channel, ChannelKind};
 pub use error::{CoreError, CoreResult};
+pub use idempotency::{IdempotencyKey, MAX_IDEMPOTENCY_KEY_LEN};
 pub use notification::{Notification, NotificationBuilder, MAX_ATTEMPTS_CEILING};
 pub use priority::Priority;
 pub use recipient::{Recipient, RecipientAddress};
