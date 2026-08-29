@@ -4,7 +4,9 @@ use std::str::FromStr;
 use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
 use ns_auth::ApiKey;
-use ns_core::{DeliveryAttempt, DeliveryStatus, Notification, Recipient, RecipientAddress, Suppression};
+use ns_core::{
+    DeliveryAttempt, DeliveryStatus, IdempotencyKey, Notification, Recipient, RecipientAddress, Suppression,
+};
 use ns_templates::Template;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use sqlx::Row;
@@ -84,10 +86,11 @@ fn to_ts(dt: DateTime<Utc>) -> String {
 impl NotificationRepository for SqliteStorage {
     async fn insert_notification(&self, notification: &Notification) -> StorageResult<()> {
         let data = serde_json::to_string(notification)?;
-        sqlx::query(
+        let result = sqlx::query(
             "INSERT INTO notifications
-                (id, tenant_id, status, priority, scheduled_for, created_at, updated_at, data)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (id, tenant_id, status, priority, scheduled_for, created_at, updated_at,
+                 idempotency_key, data)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(notification.id.to_string())
         .bind(notification.tenant_id.to_string())
@@ -96,10 +99,49 @@ impl NotificationRepository for SqliteStorage {
         .bind(notification.scheduled_for.map(to_ts))
         .bind(to_ts(notification.created_at))
         .bind(to_ts(notification.updated_at))
+        .bind(notification.idempotency_key.as_ref().map(|key| key.as_str().to_string()))
         .bind(data)
         .execute(&self.pool)
-        .await?;
-        Ok(())
+        .await;
+
+        match result {
+            Ok(_) => Ok(()),
+            // The unique index over (tenant_id, idempotency_key) is what
+            // makes a duplicate submission detectable at all -- a check
+            // followed by an insert leaves a gap two concurrent retries
+            // fit through. Translating it here means the queue gets a
+            // domain error rather than having to recognise SQLite's own
+            // constraint message.
+            Err(sqlx::Error::Database(err)) if err.is_unique_violation() => {
+                Err(StorageError::DuplicateIdempotencyKey {
+                    tenant_id: notification.tenant_id,
+                    key: notification.idempotency_key.as_ref().map(|key| key.to_string()).unwrap_or_default(),
+                })
+            }
+            Err(err) => Err(err.into()),
+        }
+    }
+
+    async fn find_by_idempotency_key(
+        &self,
+        tenant_id: Uuid,
+        key: &IdempotencyKey,
+    ) -> StorageResult<Option<Notification>> {
+        // A point query on the unique index, because this runs on the
+        // submission path ahead of every keyed insert.
+        let row = sqlx::query("SELECT data FROM notifications WHERE tenant_id = ? AND idempotency_key = ?")
+            .bind(tenant_id.to_string())
+            .bind(key.as_str())
+            .fetch_optional(&self.pool)
+            .await?;
+
+        match row {
+            Some(row) => {
+                let data: String = row.try_get("data")?;
+                Ok(Some(serde_json::from_str(&data)?))
+            }
+            None => Ok(None),
+        }
     }
 
     async fn get_notification(&self, id: Uuid) -> StorageResult<Notification> {
@@ -112,6 +154,10 @@ impl NotificationRepository for SqliteStorage {
         Ok(serde_json::from_str(&data)?)
     }
 
+    // Neither update path writes `idempotency_key`. The key names the
+    // submission that created the row, so it is set once at insert and is
+    // never a thing an update could legitimately change -- and leaving it
+    // out means an update can never trip the unique index.
     async fn update_notification(&self, notification: &Notification) -> StorageResult<()> {
         let data = serde_json::to_string(notification)?;
         let result = sqlx::query(
@@ -625,7 +671,7 @@ mod tests {
     use super::*;
     use chrono::Duration;
     use ns_auth::ApiKey;
-    use ns_core::{ChannelKind, DeliveryStatus, Priority, Recipient, RecipientAddress};
+    use ns_core::{ChannelKind, DeliveryStatus, IdempotencyKey, Priority, Recipient, RecipientAddress};
 
     /// Each test gets its own on-disk SQLite file rather than
     /// `sqlite::memory:`, since a pooled connection to `:memory:` gives
@@ -656,6 +702,112 @@ mod tests {
 
     fn sample_attempt(notification: &Notification, result: ns_core::AttemptResult) -> DeliveryAttempt {
         DeliveryAttempt::new(notification, result, Utc::now())
+    }
+
+    fn keyed_notification(tenant_id: Uuid, key: &str) -> Notification {
+        Notification::builder(tenant_id, Uuid::new_v4(), ChannelKind::Email)
+            .body("Hello there")
+            .idempotency_key(IdempotencyKey::new(key).unwrap())
+            .build()
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn finds_a_notification_by_the_key_it_was_submitted_under() {
+        let (storage, _dir) = test_storage().await;
+        let tenant_id = Uuid::new_v4();
+        let notification = keyed_notification(tenant_id, "order-1041");
+        storage.insert_notification(&notification).await.unwrap();
+
+        let key = IdempotencyKey::new("order-1041").unwrap();
+        let found = storage.find_by_idempotency_key(tenant_id, &key).await.unwrap();
+
+        assert_eq!(found.map(|n| n.id), Some(notification.id));
+    }
+
+    #[tokio::test]
+    async fn an_unused_key_is_a_miss_rather_than_an_error() {
+        let (storage, _dir) = test_storage().await;
+        let key = IdempotencyKey::new("never-used").unwrap();
+
+        let found = storage.find_by_idempotency_key(Uuid::new_v4(), &key).await.unwrap();
+
+        assert!(found.is_none(), "a fresh key is the ordinary case, not a failure");
+    }
+
+    #[tokio::test]
+    async fn idempotency_keys_do_not_reach_across_tenants() {
+        let (storage, _dir) = test_storage().await;
+        let mine = Uuid::new_v4();
+        let theirs = Uuid::new_v4();
+        storage.insert_notification(&keyed_notification(mine, "order-1041")).await.unwrap();
+
+        // The same string, chosen independently by two callers who have
+        // never heard of each other. Both submissions have to go out.
+        let theirs_notification = keyed_notification(theirs, "order-1041");
+        storage.insert_notification(&theirs_notification).await.unwrap();
+
+        let key = IdempotencyKey::new("order-1041").unwrap();
+        let found = storage.find_by_idempotency_key(theirs, &key).await.unwrap().unwrap();
+        assert_eq!(found.id, theirs_notification.id);
+    }
+
+    #[tokio::test]
+    async fn reusing_a_key_within_a_tenant_is_refused_by_the_index() {
+        let (storage, _dir) = test_storage().await;
+        let tenant_id = Uuid::new_v4();
+        storage.insert_notification(&keyed_notification(tenant_id, "order-1041")).await.unwrap();
+
+        // The check-then-insert the queue does above this has a gap in it;
+        // the unique index is what actually closes it.
+        let err =
+            storage.insert_notification(&keyed_notification(tenant_id, "order-1041")).await.unwrap_err();
+
+        assert!(
+            matches!(&err, StorageError::DuplicateIdempotencyKey { tenant_id: t, key } if *t == tenant_id && key == "order-1041"),
+            "{err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn notifications_without_a_key_never_collide() {
+        let (storage, _dir) = test_storage().await;
+        let tenant_id = Uuid::new_v4();
+
+        // Most notifications carry no key at all, and the index must not
+        // make them exclusive with each other.
+        for _ in 0..3 {
+            let notification = Notification::builder(tenant_id, Uuid::new_v4(), ChannelKind::Email)
+                .body("Hello there")
+                .build()
+                .unwrap();
+            storage.insert_notification(&notification).await.unwrap();
+        }
+
+        assert_eq!(storage.list_by_tenant(tenant_id, None, 10).await.unwrap().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn a_key_survives_the_notifications_whole_lifecycle() {
+        let (storage, _dir) = test_storage().await;
+        let tenant_id = Uuid::new_v4();
+        let mut notification = keyed_notification(tenant_id, "order-1041");
+        storage.insert_notification(&notification).await.unwrap();
+
+        // Updates deliberately leave the column alone, so a notification
+        // that has since been queued and claimed is still findable by the
+        // key its caller submitted it under -- which is exactly when a
+        // retry is most likely to arrive.
+        notification.transition(DeliveryStatus::Queued, Utc::now()).unwrap();
+        storage.update_notification(&notification).await.unwrap();
+        notification.transition(DeliveryStatus::Sending, Utc::now()).unwrap();
+        assert!(storage.try_update_notification(&notification, DeliveryStatus::Queued).await.unwrap());
+
+        let key = IdempotencyKey::new("order-1041").unwrap();
+        let found = storage.find_by_idempotency_key(tenant_id, &key).await.unwrap().unwrap();
+        assert_eq!(found.id, notification.id);
+        assert_eq!(found.status, DeliveryStatus::Sending);
+        assert_eq!(found.idempotency_key, notification.idempotency_key);
     }
 
     #[tokio::test]

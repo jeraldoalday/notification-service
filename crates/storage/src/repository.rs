@@ -3,7 +3,9 @@ use std::collections::HashMap;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use ns_auth::ApiKey;
-use ns_core::{DeliveryAttempt, DeliveryStatus, Notification, Recipient, RecipientAddress, Suppression};
+use ns_core::{
+    DeliveryAttempt, DeliveryStatus, IdempotencyKey, Notification, Recipient, RecipientAddress, Suppression,
+};
 use ns_templates::Template;
 use uuid::Uuid;
 
@@ -59,6 +61,21 @@ pub trait NotificationRepository: Send + Sync {
         status: Option<DeliveryStatus>,
         limit: u32,
     ) -> StorageResult<Vec<Notification>>;
+
+    /// The notification `tenant_id` created under `key`, or `None`.
+    ///
+    /// Scoped to a tenant because an idempotency key is a string one
+    /// caller chose: two tenants both submitting `order-1041` have said
+    /// nothing about each other, and a global lookup would let one tenant
+    /// discover -- or collide with -- another's keys.
+    ///
+    /// `None` rather than an error, because a key nobody has used yet is
+    /// the ordinary case on the submission path, not an exceptional one.
+    async fn find_by_idempotency_key(
+        &self,
+        tenant_id: Uuid,
+        key: &IdempotencyKey,
+    ) -> StorageResult<Option<Notification>>;
 
     /// How many notifications sit in each status, optionally narrowed to
     /// one tenant. Statuses with no rows are absent from the map rather

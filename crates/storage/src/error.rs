@@ -17,6 +17,16 @@ pub enum StorageError {
     #[error("template `{id}` already exists for tenant {tenant_id}")]
     TemplateAlreadyExists { tenant_id: Uuid, id: String },
 
+    /// Two submissions carrying the same idempotency key raced, and this
+    /// is the one that lost.
+    ///
+    /// Reported rather than resolved here, because resolving it means
+    /// reading the winner's notification back and comparing it against
+    /// what this caller asked for -- a queue-level decision, not a
+    /// storage-level one.
+    #[error("tenant {tenant_id} has already used idempotency key `{key}`")]
+    DuplicateIdempotencyKey { tenant_id: Uuid, key: String },
+
     #[error("api key {0} not found")]
     ApiKeyNotFound(Uuid),
 
