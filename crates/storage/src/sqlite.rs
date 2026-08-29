@@ -712,6 +712,45 @@ mod tests {
             .unwrap()
     }
 
+    /// Asserts SQLite answers `sql` from an index without a sorting pass.
+    ///
+    /// A plain "does it return the right rows" test passes just as
+    /// happily against a full scan followed by a sort, which is exactly
+    /// the regression worth catching: the query keeps working, it just
+    /// starts costing work proportional to a tenant's whole history.
+    /// EXPLAIN QUERY PLAN is the only thing that can tell the difference.
+    async fn assert_no_sorting_pass(storage: &SqliteStorage, sql: &str) {
+        let rows = sqlx::query(&format!("EXPLAIN QUERY PLAN {sql}")).fetch_all(&storage.pool).await.unwrap();
+        let plan: Vec<String> = rows.iter().map(|row| row.try_get::<String, _>("detail").unwrap()).collect();
+        let plan = plan.join("\n");
+
+        assert!(plan.contains("USING INDEX idx_notifications_tenant"), "not using the index:\n{plan}");
+        assert!(!plan.contains("TEMP B-TREE FOR ORDER BY"), "sorting after the index:\n{plan}");
+    }
+
+    #[tokio::test]
+    async fn listing_a_tenants_notifications_reads_the_order_off_the_index() {
+        let (storage, _dir) = test_storage().await;
+
+        assert_no_sorting_pass(
+            &storage,
+            "SELECT data FROM notifications WHERE tenant_id = 'x' ORDER BY created_at DESC LIMIT 50",
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn listing_by_status_reads_the_order_off_the_index_too() {
+        let (storage, _dir) = test_storage().await;
+
+        assert_no_sorting_pass(
+            &storage,
+            "SELECT data FROM notifications WHERE tenant_id = 'x' AND status = 'queued'
+             ORDER BY created_at DESC LIMIT 50",
+        )
+        .await;
+    }
+
     #[tokio::test]
     async fn finds_a_notification_by_the_key_it_was_submitted_under() {
         let (storage, _dir) = test_storage().await;

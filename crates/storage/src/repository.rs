@@ -52,9 +52,14 @@ pub trait NotificationRepository: Send + Sync {
     async fn due_for_delivery(&self, now: DateTime<Utc>, limit: u32) -> StorageResult<Vec<Notification>>;
 
     /// Notifications belonging to `tenant_id`, optionally narrowed to a
-    /// single `status`, newest-first, capped at `limit`. Backed by
-    /// `idx_notifications_tenant` (plus the `status` column already indexed
-    /// for `due_for_delivery` when a status filter is supplied).
+    /// single `status`, newest-first, capped at `limit`.
+    ///
+    /// Backed by `idx_notifications_tenant` -- or by
+    /// `idx_notifications_tenant_status` when a status filter is supplied.
+    /// Both carry `created_at DESC`, so the newest-first ordering is read
+    /// straight off the index rather than sorted afterwards: without that,
+    /// answering a fifty-row page costs work proportional to everything
+    /// the tenant has ever sent.
     async fn list_by_tenant(
         &self,
         tenant_id: Uuid,
