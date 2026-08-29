@@ -4,7 +4,8 @@ use chrono::{DateTime, Utc};
 use ns_core::{ChannelKind, DeliveryAttempt, DeliveryStatus, IdempotencyKey, Notification, Priority};
 use ns_queue::NotificationQueue;
 use ns_storage::{
-    DeliveryAttemptRepository, NotificationRepository, RecipientRepository, SqliteStorage, TemplateRepository,
+    DeliveryAttemptRepository, NotificationRepository, RecipientRepository, SqliteStorage,
+    SuppressionRepository, TemplateRepository,
 };
 use uuid::Uuid;
 
@@ -33,7 +34,44 @@ pub struct SubmitArgs {
 /// does: an unknown recipient or template is reported now rather than
 /// discovered by the worker several backoff delays later.
 pub async fn submit(storage: &SqliteStorage, args: SubmitArgs, output: OutputFormat) -> CliResult<String> {
-    storage.get_recipient(args.recipient_id).await?;
+    let recipient = storage.get_recipient(args.recipient_id).await?;
+
+    // The recipient has to belong to the tenant being submitted for.
+    // Without this the CLI is a way to address someone else's recipient
+    // -- and unlike every other cross-tenant path, the message would
+    // actually go out: the worker resolves the address from the recipient
+    // row and has no reason to doubt a notification that reached it
+    // through the queue. The API refuses this with a 404; going straight
+    // to the database is a reason for this tool to keep working when the
+    // API is down, not a reason for it to enforce less.
+    //
+    // Reported plainly rather than as a 404-shaped "no such recipient",
+    // because the audience is different: an operator on the host is not
+    // someone the id should be hidden from, and telling them the
+    // recipient exists but belongs elsewhere is what lets them fix the
+    // command.
+    if !recipient.belongs_to(args.tenant_id) {
+        return Err(CliError::Invalid(format!(
+            "recipient {} belongs to tenant {}, not {}",
+            recipient.id, recipient.tenant_id, args.tenant_id
+        )));
+    }
+
+    // And the address has to be one this tenant may still send to. The
+    // worker checks again before the send, so nothing escapes either way;
+    // what this buys is that the operator finds out now rather than
+    // reading `suppressed` off a status a minute later and wondering
+    // which of the two addresses on the recipient it meant.
+    if let Ok(address) = recipient.address_for(args.channel) {
+        if let Some(suppression) = storage.find_suppression(args.tenant_id, address).await? {
+            return Err(CliError::Invalid(format!(
+                "{} address `{}` is suppressed for this tenant ({})",
+                args.channel,
+                address.value(),
+                suppression.reason
+            )));
+        }
+    }
 
     let mut builder =
         Notification::builder(args.tenant_id, args.recipient_id, args.channel).priority(args.priority);

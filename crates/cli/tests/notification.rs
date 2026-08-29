@@ -11,8 +11,11 @@ use ns_templates::Template;
 use support::test_storage;
 use uuid::Uuid;
 
-async fn seed_recipient(storage: &SqliteStorage) -> Uuid {
-    let recipient = Recipient::new(Uuid::new_v4(), Uuid::new_v4())
+/// A recipient belonging to `tenant_id`. Submissions are refused unless
+/// the recipient belongs to the tenant they are made for, so the two have
+/// to be seeded together.
+async fn seed_recipient(storage: &SqliteStorage, tenant_id: Uuid) -> Uuid {
+    let recipient = Recipient::new(Uuid::new_v4(), tenant_id)
         .with_address(RecipientAddress::Email("ada@example.com".into()))
         .unwrap();
     storage.insert_recipient(&recipient).await.unwrap();
@@ -38,8 +41,8 @@ fn args(tenant_id: Uuid, recipient_id: Uuid) -> SubmitArgs {
 #[tokio::test]
 async fn submit_queues_a_notification() {
     let (storage, _dir) = test_storage().await;
-    let recipient_id = seed_recipient(&storage).await;
     let tenant_id = Uuid::new_v4();
+    let recipient_id = seed_recipient(&storage, tenant_id).await;
 
     let rendered =
         notification::submit(&storage, args(tenant_id, recipient_id), OutputFormat::Json).await.unwrap();
@@ -62,10 +65,47 @@ async fn submit_rejects_an_unknown_recipient() {
 }
 
 #[tokio::test]
+async fn submit_refuses_another_tenants_recipient() {
+    let (storage, _dir) = test_storage().await;
+    let recipient_id = seed_recipient(&storage, Uuid::new_v4()).await;
+
+    // Not a hypothetical boundary: the worker resolves the address from
+    // the recipient row, so this message would actually go out to someone
+    // this tenant was never given.
+    let err = notification::submit(&storage, args(Uuid::new_v4(), recipient_id), OutputFormat::Text)
+        .await
+        .unwrap_err();
+
+    assert!(err.to_string().contains("belongs to tenant"), "got {err}");
+}
+
+#[tokio::test]
+async fn submit_refuses_a_suppressed_address() {
+    let (storage, _dir) = test_storage().await;
+    let tenant_id = Uuid::new_v4();
+    let recipient_id = seed_recipient(&storage, tenant_id).await;
+    let suppression = ns_core::Suppression::new(
+        tenant_id,
+        RecipientAddress::Email("ada@example.com".into()),
+        ns_core::SuppressionReason::Unsubscribed,
+        chrono::Utc::now(),
+    )
+    .unwrap();
+    ns_storage::SuppressionRepository::insert_suppression(&storage, &suppression).await.unwrap();
+
+    let err =
+        notification::submit(&storage, args(tenant_id, recipient_id), OutputFormat::Text).await.unwrap_err();
+
+    assert!(err.to_string().contains("suppressed"), "got {err}");
+    assert!(storage.list_by_tenant(tenant_id, None, 10).await.unwrap().is_empty(), "nothing was queued");
+}
+
+#[tokio::test]
 async fn submit_rejects_an_unknown_template() {
     let (storage, _dir) = test_storage().await;
-    let recipient_id = seed_recipient(&storage).await;
-    let mut args = args(Uuid::new_v4(), recipient_id);
+    let tenant_id = Uuid::new_v4();
+    let recipient_id = seed_recipient(&storage, tenant_id).await;
+    let mut args = args(tenant_id, recipient_id);
     args.body = None;
     args.template_id = Some("nope".into());
 
@@ -77,8 +117,8 @@ async fn submit_rejects_an_unknown_template() {
 #[tokio::test]
 async fn submit_rejects_missing_template_variables() {
     let (storage, _dir) = test_storage().await;
-    let recipient_id = seed_recipient(&storage).await;
     let tenant_id = Uuid::new_v4();
+    let recipient_id = seed_recipient(&storage, tenant_id).await;
     storage.insert_template(&Template::new(tenant_id, "welcome", "Hi {{name}}").unwrap()).await.unwrap();
 
     let mut args = args(tenant_id, recipient_id);
@@ -93,8 +133,8 @@ async fn submit_rejects_missing_template_variables() {
 #[tokio::test]
 async fn submit_accepts_a_template_with_its_variables() {
     let (storage, _dir) = test_storage().await;
-    let recipient_id = seed_recipient(&storage).await;
     let tenant_id = Uuid::new_v4();
+    let recipient_id = seed_recipient(&storage, tenant_id).await;
     storage.insert_template(&Template::new(tenant_id, "welcome", "Hi {{name}}").unwrap()).await.unwrap();
 
     let mut args = args(tenant_id, recipient_id);
@@ -110,8 +150,8 @@ async fn submit_accepts_a_template_with_its_variables() {
 #[tokio::test]
 async fn show_renders_grep_friendly_fields() {
     let (storage, _dir) = test_storage().await;
-    let recipient_id = seed_recipient(&storage).await;
     let tenant_id = Uuid::new_v4();
+    let recipient_id = seed_recipient(&storage, tenant_id).await;
     let submitted =
         notification::submit(&storage, args(tenant_id, recipient_id), OutputFormat::Json).await.unwrap();
     let id: Uuid = serde_json::from_str::<serde_json::Value>(&submitted).unwrap()["id"]
@@ -137,10 +177,13 @@ async fn show_reports_an_unknown_id() {
 #[tokio::test]
 async fn list_is_tenant_scoped_and_filterable() {
     let (storage, _dir) = test_storage().await;
-    let recipient_id = seed_recipient(&storage).await;
     let tenant_id = Uuid::new_v4();
+    let recipient_id = seed_recipient(&storage, tenant_id).await;
     notification::submit(&storage, args(tenant_id, recipient_id), OutputFormat::Json).await.unwrap();
-    notification::submit(&storage, args(Uuid::new_v4(), recipient_id), OutputFormat::Json).await.unwrap();
+
+    let other_tenant = Uuid::new_v4();
+    let other_recipient = seed_recipient(&storage, other_tenant).await;
+    notification::submit(&storage, args(other_tenant, other_recipient), OutputFormat::Json).await.unwrap();
 
     let mine: serde_json::Value = serde_json::from_str(
         &notification::list(&storage, tenant_id, None, 50, OutputFormat::Json).await.unwrap(),
@@ -170,9 +213,10 @@ async fn list_renders_a_header_even_when_empty() {
 #[tokio::test]
 async fn cancel_moves_a_queued_notification_to_cancelled() {
     let (storage, _dir) = test_storage().await;
-    let recipient_id = seed_recipient(&storage).await;
+    let tenant_id = Uuid::new_v4();
+    let recipient_id = seed_recipient(&storage, tenant_id).await;
     let submitted =
-        notification::submit(&storage, args(Uuid::new_v4(), recipient_id), OutputFormat::Json).await.unwrap();
+        notification::submit(&storage, args(tenant_id, recipient_id), OutputFormat::Json).await.unwrap();
     let id: Uuid = serde_json::from_str::<serde_json::Value>(&submitted).unwrap()["id"]
         .as_str()
         .unwrap()
@@ -187,9 +231,10 @@ async fn cancel_moves_a_queued_notification_to_cancelled() {
 #[tokio::test]
 async fn cancel_refuses_work_that_is_already_sending() {
     let (storage, _dir) = test_storage().await;
-    let recipient_id = seed_recipient(&storage).await;
+    let tenant_id = Uuid::new_v4();
+    let recipient_id = seed_recipient(&storage, tenant_id).await;
     let submitted =
-        notification::submit(&storage, args(Uuid::new_v4(), recipient_id), OutputFormat::Json).await.unwrap();
+        notification::submit(&storage, args(tenant_id, recipient_id), OutputFormat::Json).await.unwrap();
     let id: Uuid = serde_json::from_str::<serde_json::Value>(&submitted).unwrap()["id"]
         .as_str()
         .unwrap()
@@ -207,9 +252,10 @@ async fn cancel_refuses_work_that_is_already_sending() {
 #[tokio::test]
 async fn replay_refuses_a_notification_that_did_not_dead_letter() {
     let (storage, _dir) = test_storage().await;
-    let recipient_id = seed_recipient(&storage).await;
+    let tenant_id = Uuid::new_v4();
+    let recipient_id = seed_recipient(&storage, tenant_id).await;
     let submitted =
-        notification::submit(&storage, args(Uuid::new_v4(), recipient_id), OutputFormat::Json).await.unwrap();
+        notification::submit(&storage, args(tenant_id, recipient_id), OutputFormat::Json).await.unwrap();
     let id: Uuid = serde_json::from_str::<serde_json::Value>(&submitted).unwrap()["id"]
         .as_str()
         .unwrap()
