@@ -14,7 +14,8 @@ Early and under active development. The domain model, configuration layer,
 SQLite storage layer, job queue, channel providers, worker process, HTTP
 API, notification templates, the `ns` admin CLI, Prometheus metrics,
 API-key authentication with per-tenant isolation, a per-attempt delivery
-history and a per-tenant suppression list are all in place.
+history, a per-tenant suppression list and idempotent submission are all
+in place.
 
 ## Workspace layout
 
@@ -55,6 +56,7 @@ database, and serves on `NS_SERVER_HOST:NS_SERVER_PORT` (default
 | GET    | `/recipients/{id}`           | Fetch a recipient                              |
 | POST   | `/notifications`             | Submit a notification (queues it for delivery) |
 | GET    | `/notifications/{id}`        | Fetch a notification's current status          |
+| GET    | `/notifications/by-key/{key}` | Fetch the notification submitted under an idempotency key |
 | GET    | `/notifications/{id}/attempts` | Every delivery attempt made for it, oldest first |
 | GET    | `/attempts?tenant_id=`       | A tenant's recent attempts, newest-first       |
 | GET    | `/notifications?tenant_id=`  | List a tenant's notifications, newest-first    |
@@ -125,6 +127,7 @@ the service:
 | Metric | Type | Labels |
 | ------ | ---- | ------ |
 | `ns_notifications_submitted_total` | counter | `channel` |
+| `ns_notifications_deduplicated_total` | counter | `channel` |
 | `ns_notification_attempts_total` | counter | `channel`, `outcome` |
 | `ns_notification_skipped_total` | counter | `channel`, `reason` |
 | `ns_notification_send_duration_seconds` | histogram | `channel` |
@@ -149,6 +152,62 @@ let state = AppState::with_metrics(storage.clone(), Arc::clone(&metrics));
 let worker = Worker::new(storage, channels, rate_limiter, breaker)
     .with_metrics(metrics);
 ```
+
+## Idempotent submission
+
+A client whose connection drops mid-submission cannot tell "never
+arrived" from "arrived, and the response was lost". Retrying risks
+sending twice; not retrying risks not sending at all. An
+`Idempotency-Key` header removes the choice:
+
+```sh
+curl -X POST localhost:8080/notifications \
+     -H "Authorization: Bearer $K" \
+     -H "Idempotency-Key: order-1041-shipped" \
+     -d '{"recipient_id": "...", "channel": "email", "body": "Your order shipped"}'
+```
+
+The first submission answers `201` with a new notification. Any repeat of
+it answers `200` with that same notification, plus an
+`Idempotent-Replay: true` header, and queues nothing:
+
+| Situation | Response |
+| --------- | -------- |
+| Key unused | `201`, the newly queued notification |
+| Same key, same content | `200`, the notification the first call created |
+| Same key, different content | `409` -- the second message would otherwise vanish silently |
+| Same key, different tenant | `201` -- keys are scoped to the tenant that used them |
+
+Keys are validated, not normalised: at most 255 printable ASCII
+characters, no spaces. A retry is byte-for-byte the client's first
+attempt, so a service that stored a trimmed or lowercased key would fail
+to match the retry that arrives. A malformed key is a `400` rather than
+being ignored -- ignoring it would send the message and answer `201` to a
+caller that believes it asked for deduplication.
+
+A replayed submission skips the recipient, suppression and template
+checks. Those describe a message that was already accepted, and
+re-running them would let a retry fail over a recipient deleted or an
+address suppressed since. A *first* submission still faces all of them.
+
+If a client never saw the response at all, it can ask without being
+willing to send:
+
+```sh
+curl "localhost:8080/notifications/by-key/order-1041-shipped" -H "Authorization: Bearer $K"
+```
+
+The same is available on the host, through the CLI:
+
+```sh
+ns notification submit --tenant $T --recipient $R --channel email \
+    --body "Your order shipped" --idempotency-key order-1041-shipped
+ns notification by-key --tenant $T order-1041-shipped
+```
+
+Replaying a dead-lettered notification deliberately drops its key: a
+replay is an operator asking for the message to go out again, which is
+the one thing an idempotency key exists to prevent happening by accident.
 
 ## Delivery history
 
@@ -265,6 +324,9 @@ ns apikey list --tenant $T
 ns recipient add --tenant $T --email ada@example.com --display-name "Ada Lovelace"
 ns notification submit --tenant $T --recipient $R --channel email \
     --template order_shipped --var name=Ada --var order_id=1234
+ns notification submit --tenant $T --recipient $R --channel email \
+    --body "Your order shipped" --idempotency-key order-1041
+ns notification by-key --tenant $T order-1041
 ns notification list --tenant $T --status dead_lettered
 ns notification attempts $N       # why did this one dead-letter?
 ns queue due                      # what the next worker poll would claim

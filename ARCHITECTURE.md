@@ -210,6 +210,52 @@ who can reach it; the serve binary warns loudly at startup when it does,
 because an open notification sender should be a choice someone made rather
 than something they discover later.
 
+## Idempotency
+
+Submitting a notification is the one operation here that is unsafe to
+retry blindly. A client whose connection drops after the service accepted
+the request cannot tell "never arrived" from "arrived, and the response
+was lost", and the two call for opposite responses. An `IdempotencyKey`
+lets it stop having to tell them apart: the key names the caller's
+*intent*, so a second submission carrying a key the tenant has already
+used resolves to the notification that key already created.
+
+The design decisions worth recording:
+
+- **Validated, never normalised.** A retry is byte-for-byte the client's
+  first attempt. Trimming or lowercasing would mean the stored key is not
+  the presented key, and every future lookup would have to reproduce the
+  same normalisation to match. Odd keys are refused up front instead,
+  while the caller is still on the line and before anything has been
+  sent.
+- **The unique index is the mechanism, not the lookup.** Checking whether
+  a key has been used and then inserting is two statements with a gap
+  between them, and two of a client's own retries arriving concurrently is
+  exactly the situation retries exist for. The lookup is the fast path
+  for the common case; `UNIQUE (tenant_id, idempotency_key)` is what makes
+  the guarantee hold. The insert that loses reads the winner's row back,
+  so two racing retries are indistinguishable from two sequential ones.
+- **Scoped to a tenant.** The key is a string one caller picked. Two
+  tenants both submitting `order-1041` have said nothing about each other.
+- **A reused key with different content is a 409.** Answering with the
+  first notification would drop the second message with nothing anywhere
+  reporting a failure. What counts as "the same message" is
+  `Notification::has_same_content_as` -- a field-by-field comparison of
+  what the service will act on, rather than a hash of the request body,
+  since two bodies can differ in key order or whitespace while asking for
+  exactly the same thing.
+- **A replay skips the up-front checks.** The recipient, suppression and
+  template checks describe a message that was already accepted; re-running
+  them would let a retry fail over a recipient deleted or an address
+  suppressed since, turning the one call that exists to make retrying safe
+  into the one that punishes it. A first submission still faces all of
+  them.
+- **`NotificationQueue::replay` drops the key.** A replay is an operator
+  deliberately sending the message again, which is the one thing an
+  idempotency key exists to prevent by accident -- and carrying it over
+  would collide with the original on the unique index and fail the replay
+  outright.
+
 ## Delivery lifecycle
 
 A notification moves through `DeliveryStatus` states one-directionally:
@@ -252,3 +298,9 @@ This file is updated as each part lands. Currently implemented:
       worker and HTTP instrumentation)
 - [x] Auth & multi-tenancy (`ns-auth`: API keys, scopes, per-tenant
       isolation across notifications, templates and recipients)
+- [x] Delivery history (`DeliveryAttempt`: per-attempt log, API, CLI,
+      retention purge)
+- [x] Suppression list (per-tenant, per-address, enforced on the delivery
+      path)
+- [x] Idempotent submission (`IdempotencyKey`: `Idempotency-Key` header,
+      by-key lookup, CLI)
