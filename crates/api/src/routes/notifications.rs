@@ -360,6 +360,49 @@ where
     }
 }
 
+/// The tenant a by-key lookup is for, when the API is running without
+/// authentication. An authenticated caller's key already says.
+#[derive(Debug, Deserialize)]
+pub struct ByKeyQuery {
+    pub tenant_id: Option<Uuid>,
+}
+
+/// Fetches the notification a tenant submitted under `key`.
+///
+/// This is what a client does when it never saw the response to a
+/// submission and does not want to re-send it to find out -- during an
+/// incident, say, where re-submitting a thousand buffered requests to
+/// learn which ones landed is exactly the traffic nobody wants. The
+/// submit endpoint would answer the same question, but only by being
+/// willing to send the message if the answer turns out to be "it never
+/// arrived"; this one is a plain read.
+///
+/// A key that names nothing answers 404, and so does a key belonging to
+/// another tenant -- which is not a special case here, because the lookup
+/// is tenant-scoped in storage and never sees the other tenant's row at
+/// all.
+pub async fn get_notification_by_key<R>(
+    State(state): State<AppState<R>>,
+    caller: Caller,
+    Path(key): Path<String>,
+    Query(query): Query<ByKeyQuery>,
+) -> ApiResult<Json<NotificationResponse>>
+where
+    R: Repositories,
+{
+    caller.require(Scope::Read)?;
+    let tenant_id = caller.tenant_for(query.tenant_id)?;
+    let key = IdempotencyKey::new(key)?;
+
+    let notification = state
+        .repo
+        .find_by_idempotency_key(tenant_id, &key)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("no notification was submitted under key `{key}`")))?;
+
+    Ok(Json(notification.into()))
+}
+
 pub async fn get_notification<R>(
     State(state): State<AppState<R>>,
     caller: Caller,

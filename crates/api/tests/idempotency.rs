@@ -237,3 +237,55 @@ async fn a_deduplicated_submission_is_counted_apart_from_a_queued_one() {
     assert!(text.contains("ns_notifications_submitted_total{channel=\"email\"} 1"), "{text}");
     assert!(text.contains("ns_notifications_deduplicated_total{channel=\"email\"} 1"), "{text}");
 }
+
+#[tokio::test]
+async fn a_notification_can_be_looked_up_by_the_key_it_was_submitted_under() {
+    let (app, _dir) = test_app().await;
+    let recipient_id = create_recipient(&app).await;
+    let created: Value =
+        json_body(send(&app, keyed_submit("order-1041", submission(&recipient_id))).await).await;
+
+    // What a client does when it never saw the response and doesn't want
+    // to re-send a thousand buffered requests to find out which landed.
+    let response = send(&app, get(&format!("/notifications/by-key/order-1041?tenant_id={TENANT}"))).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let found: Value = json_body(response).await;
+    assert_eq!(found["id"], created["id"]);
+    assert_eq!(found["idempotency_key"], "order-1041");
+}
+
+#[tokio::test]
+async fn an_unused_key_is_not_found() {
+    let (app, _dir) = test_app().await;
+
+    let response = send(&app, get(&format!("/notifications/by-key/never-used?tenant_id={TENANT}"))).await;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn another_tenants_key_is_not_found_either() {
+    let (app, _dir) = test_app().await;
+    let recipient_id = create_recipient(&app).await;
+    send(&app, keyed_submit("order-1041", submission(&recipient_id))).await;
+
+    let theirs = Uuid::new_v4();
+    let response = send(&app, get(&format!("/notifications/by-key/order-1041?tenant_id={theirs}"))).await;
+
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn looking_up_by_key_does_not_shadow_looking_up_by_id() {
+    let (app, _dir) = test_app().await;
+    let recipient_id = create_recipient(&app).await;
+    let created: Value =
+        json_body(send(&app, post_json("/notifications", submission(&recipient_id))).await).await;
+
+    // `by-key` is a literal path segment sharing a prefix with
+    // /notifications/{id}; the id route has to keep working.
+    let response = send(&app, get(&format!("/notifications/{}", created["id"].as_str().unwrap()))).await;
+
+    assert_eq!(response.status(), StatusCode::OK);
+}

@@ -42,6 +42,11 @@ where
             "/notifications",
             post(notifications::submit_notification).get(notifications::list_notifications),
         )
+        // Ahead of /notifications/{id} in the table for readability
+        // only -- `by-key` is a literal segment, and a literal always
+        // wins over a parameter regardless of registration order, so an
+        // id can never be swallowed by it.
+        .route("/notifications/by-key/{key}", get(notifications::get_notification_by_key))
         .route("/notifications/{id}", get(notifications::get_notification))
         .route("/notifications/{id}/cancel", post(notifications::cancel_notification))
         .route("/notifications/{id}/attempts", get(notifications::list_notification_attempts))
