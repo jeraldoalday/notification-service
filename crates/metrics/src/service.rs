@@ -83,6 +83,7 @@ impl SkipReason {
 pub struct ServiceMetrics {
     registry: Arc<Registry>,
     submitted: HashMap<ChannelKind, Arc<Counter>>,
+    deduplicated: HashMap<ChannelKind, Arc<Counter>>,
     attempts: HashMap<(ChannelKind, AttemptOutcome), Arc<Counter>>,
     skips: HashMap<(ChannelKind, SkipReason), Arc<Counter>>,
     send_duration: HashMap<ChannelKind, Arc<Histogram>>,
@@ -99,6 +100,7 @@ impl ServiceMetrics {
 
     pub fn with_registry(registry: Arc<Registry>) -> Self {
         let mut submitted = HashMap::new();
+        let mut deduplicated = HashMap::new();
         let mut attempts = HashMap::new();
         let mut skips = HashMap::new();
         let mut send_duration = HashMap::new();
@@ -110,6 +112,14 @@ impl ServiceMetrics {
                 registry.counter(
                     "ns_notifications_submitted_total",
                     "Notifications accepted onto the queue.",
+                    channel_label.clone(),
+                ),
+            );
+            deduplicated.insert(
+                channel,
+                registry.counter(
+                    "ns_notifications_deduplicated_total",
+                    "Submissions answered from an idempotency key instead of being queued again.",
                     channel_label.clone(),
                 ),
             );
@@ -174,6 +184,7 @@ impl ServiceMetrics {
         Self {
             registry,
             submitted,
+            deduplicated,
             attempts,
             skips,
             send_duration,
@@ -198,6 +209,24 @@ impl ServiceMetrics {
         // cannot miss -- but a missing metric is never worth taking the
         // process down over, so it's a silent no-op rather than an unwrap.
         if let Some(counter) = self.submitted.get(&channel) {
+            counter.inc();
+        }
+    }
+
+    /// Records a submission that an idempotency key resolved to an
+    /// existing notification.
+    ///
+    /// Counted separately from `submitted` rather than folded into it,
+    /// because the two answer different questions. `submitted` is how many
+    /// messages the service took responsibility for delivering; this is
+    /// how many times a client asked twice. A deduplicated submission
+    /// sends nothing, so counting it as a submission would make the
+    /// submitted total stop matching what actually goes out -- and the
+    /// ratio between the two is a genuinely useful signal on its own: a
+    /// client whose deduplication rate climbs is a client whose requests
+    /// are timing out somewhere.
+    pub fn record_deduplicated(&self, channel: ChannelKind) {
+        if let Some(counter) = self.deduplicated.get(&channel) {
             counter.inc();
         }
     }
@@ -289,6 +318,30 @@ mod tests {
                 );
                 assert!(text.contains(&expected), "missing series: {expected}");
             }
+        }
+    }
+
+    #[test]
+    fn a_deduplicated_submission_is_counted_apart_from_a_real_one() {
+        let metrics = ServiceMetrics::new();
+        metrics.record_submitted(ChannelKind::Email);
+        metrics.record_deduplicated(ChannelKind::Email);
+        metrics.record_deduplicated(ChannelKind::Email);
+
+        let text = metrics.render();
+        // The submitted total has to keep matching what the service
+        // actually took responsibility for sending.
+        assert!(text.contains("ns_notifications_submitted_total{channel=\"email\"} 1"), "{text}");
+        assert!(text.contains("ns_notifications_deduplicated_total{channel=\"email\"} 2"), "{text}");
+    }
+
+    #[test]
+    fn every_channel_exports_a_deduplication_series_from_the_start() {
+        let text = ServiceMetrics::new().render();
+        for channel in ChannelKind::all() {
+            let expected =
+                format!("ns_notifications_deduplicated_total{{channel=\"{}\"}} 0", channel.as_str());
+            assert!(text.contains(&expected), "missing series: {expected}");
         }
     }
 
