@@ -36,6 +36,15 @@ pub fn suppression_reason(raw: &str) -> Result<ns_core::SuppressionReason, Strin
     raw.parse().map_err(|err: ns_core::CoreError| err.to_string())
 }
 
+/// Parses an `--idempotency-key` value. Forwards to the domain's own
+/// validation, so the CLI accepts exactly the keys the HTTP API does --
+/// a key that works through one has to work through the other, or an
+/// operator reproducing a client's submission by hand gets a different
+/// answer than the client did.
+pub fn idempotency_key(raw: &str) -> Result<ns_core::IdempotencyKey, String> {
+    raw.parse().map_err(|err: ns_core::CoreError| err.to_string())
+}
+
 pub fn priority(raw: &str) -> Result<Priority, String> {
     parse_enum(raw, &["low", "normal", "high", "critical"])
 }
@@ -85,6 +94,13 @@ mod tests {
             assert_eq!(suppression_reason(value.as_str()).unwrap(), value);
         }
         assert!(suppression_reason("annoyed").is_err());
+    }
+
+    #[test]
+    fn parses_the_idempotency_keys_the_api_accepts() {
+        assert_eq!(idempotency_key("order-1041").unwrap().as_str(), "order-1041");
+        assert!(idempotency_key("has spaces").is_err());
+        assert!(idempotency_key("").is_err());
     }
 
     #[test]

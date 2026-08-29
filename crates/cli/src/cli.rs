@@ -263,6 +263,18 @@ pub enum NotificationCommand {
         id: Uuid,
     },
 
+    /// Show the notification a tenant submitted under an idempotency key.
+    ///
+    /// The lookup a client makes when it never saw the response to its
+    /// own submission -- and the one an operator makes to answer "did
+    /// that order's email actually go out?" from the order id alone.
+    ByKey {
+        #[arg(long)]
+        tenant: Uuid,
+
+        key: String,
+    },
+
     /// List a tenant's notifications, newest first.
     List {
         #[arg(long)]
@@ -321,6 +333,12 @@ pub struct SubmitArgs {
     /// A template variable, as name=value. Repeat for each one.
     #[arg(long = "var", value_parser = parse::key_value)]
     pub vars: Vec<(String, String)>,
+
+    /// Name this submission, so re-running the same command resolves to
+    /// the notification the first run created instead of sending a
+    /// second message.
+    #[arg(long, value_parser = parse::idempotency_key)]
+    pub idempotency_key: Option<ns_core::IdempotencyKey>,
 
     #[arg(long)]
     pub max_attempts: Option<u32>,

@@ -32,6 +32,9 @@ async fn run() -> CliResult<()> {
         Command::Notification(NotificationCommand::Show { id }) => {
             commands::notification::show(&storage, id, cli.output).await?
         }
+        Command::Notification(NotificationCommand::ByKey { tenant, key }) => {
+            commands::notification::by_key(&storage, tenant, &key, cli.output).await?
+        }
         Command::Notification(NotificationCommand::List { tenant, status, limit }) => {
             commands::notification::list(&storage, tenant, status, limit, cli.output).await?
         }
@@ -147,6 +150,7 @@ fn submit_args(args: SubmitArgs) -> CliResult<commands::notification::SubmitArgs
         body: args.body,
         template_id: args.template,
         template_vars: args.vars.into_iter().collect(),
+        idempotency_key: args.idempotency_key,
         max_attempts: args.max_attempts,
         scheduled_for: args.schedule.as_deref().map(parse_timestamp).transpose()?,
     })

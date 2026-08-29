@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
-use ns_core::{ChannelKind, DeliveryAttempt, DeliveryStatus, Notification, Priority};
+use ns_core::{ChannelKind, DeliveryAttempt, DeliveryStatus, IdempotencyKey, Notification, Priority};
 use ns_queue::NotificationQueue;
 use ns_storage::{
     DeliveryAttemptRepository, NotificationRepository, RecipientRepository, SqliteStorage, TemplateRepository,
@@ -24,6 +24,7 @@ pub struct SubmitArgs {
     pub body: Option<String>,
     pub template_id: Option<String>,
     pub template_vars: HashMap<String, String>,
+    pub idempotency_key: Option<IdempotencyKey>,
     pub max_attempts: Option<u32>,
     pub scheduled_for: Option<DateTime<Utc>>,
 }
@@ -48,6 +49,9 @@ pub async fn submit(storage: &SqliteStorage, args: SubmitArgs, output: OutputFor
     for (key, value) in args.template_vars {
         builder = builder.template_var(key, value);
     }
+    if let Some(key) = args.idempotency_key {
+        builder = builder.idempotency_key(key);
+    }
     if let Some(max_attempts) = args.max_attempts {
         builder = builder.max_attempts(max_attempts);
     }
@@ -62,8 +66,43 @@ pub async fn submit(storage: &SqliteStorage, args: SubmitArgs, output: OutputFor
     }
 
     let queue = NotificationQueue::new(storage.clone());
-    let submitted = queue.submit(notification, Utc::now()).await?;
-    output.render(&submitted, || describe(&submitted))
+    let submission = queue.submit_idempotent(notification, Utc::now()).await?;
+
+    // The JSON rendering stays the notification itself, unwrapped, so a
+    // script that already parses this command's output keeps working; the
+    // deduplication note is a line of text for the operator reading it.
+    // An `--idempotency-key` run that prints an id it didn't create is
+    // the one case where saying nothing would mislead.
+    let deduplicated = submission.is_duplicate();
+    let submitted = submission.into_notification();
+    output.render(&submitted, || {
+        let described = describe(&submitted);
+        if deduplicated {
+            return format!("{described}note: already submitted under this key; nothing was queued\n");
+        }
+        described
+    })
+}
+
+/// Shows the notification a tenant submitted under `key`.
+///
+/// The question an operator asks from an order id when someone reports a
+/// missing email: was it ever submitted, and what became of it. A key
+/// that names nothing is an error rather than empty output, because the
+/// two possible answers -- "never submitted" and "submitted, here it is"
+/// -- should not be told apart by noticing that stdout was blank.
+pub async fn by_key(
+    storage: &SqliteStorage,
+    tenant_id: Uuid,
+    key: &str,
+    output: OutputFormat,
+) -> CliResult<String> {
+    let key = IdempotencyKey::new(key)?;
+    let notification = storage
+        .find_by_idempotency_key(tenant_id, &key)
+        .await?
+        .ok_or_else(|| CliError::Invalid(format!("tenant {tenant_id} has not used key `{key}`")))?;
+    output.render(&notification, || describe(&notification))
 }
 
 pub async fn show(storage: &SqliteStorage, id: Uuid, output: OutputFormat) -> CliResult<String> {
@@ -185,6 +224,9 @@ fn describe(n: &Notification) -> String {
     }
     if let Some(template_id) = &n.template_id {
         field("template", template_id.clone());
+    }
+    if let Some(key) = &n.idempotency_key {
+        field("idempotency-key", key.to_string());
     }
     if let Some(scheduled_for) = n.scheduled_for {
         field("scheduled", scheduled_for.to_rfc3339());
