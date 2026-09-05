@@ -25,7 +25,8 @@ so each concern can be tested and evolved independently:
   `std::env` directly wherever overrides are applied, so the override logic
   is unit-testable without mutating global process state.
 - **`ns-storage`** -- `NotificationRepository`, `RecipientRepository`,
-  `TemplateRepository` and `ApiKeyRepository` traits with a SQLite
+  `TemplateRepository`, `ApiKeyRepository`, `DeliveryAttemptRepository`,
+  `SuppressionRepository` and `PreferenceRepository` traits with a SQLite
   implementation (via `sqlx`). Each entity is stored
   as a full JSON document in a `data` column, alongside a handful of plain
   columns (`status`, `priority`, `scheduled_for`, `tenant_id`) that exist
@@ -102,8 +103,16 @@ so each concern can be tested and evolved independently:
 - **`ns-worker`** -- dequeues due notifications via `ns-queue::claim_batch`
   and dispatches each to the `ns-channels` implementation matching its
   `ChannelKind`, looked up through a `ChannelRegistry` built at startup from
-  whichever channels the deployment has credentials for. Two guards run
-  before every send: a per-channel `CircuitBreaker` (trips open after
+  whichever channels the deployment has credentials for. Dispatch runs in
+  two phases. First, whether the notification should be sent at all: the
+  recipient's preferences for its topic, the channel registry, the
+  recipient's address for that channel, that address against the tenant's
+  suppression list, and finally whether the message renders. Rendering
+  comes last of those because the checks above it decide that nothing
+  will be sent -- running it first meant an unrenderable template
+  attached to a suppressed address dead-lettered as a template failure
+  and the suppression never showed up in the counts. Then, whether it can
+  be sent now. Two guards run before every send: a per-channel `CircuitBreaker` (trips open after
   consecutive failures on that channel, so a provider that's down doesn't
   get hammered; half-opens after a cooldown to trial recovery) and a
   per-channel `RateLimiter` (token bucket, so a burst against one provider
@@ -256,6 +265,72 @@ The design decisions worth recording:
   would collide with the original on the unique index and fail the replay
   outright.
 
+## Delivery preferences
+
+Suppression answers "may this address be written to at all?". It is keyed
+by address, and the thing talking is usually the provider or an operator:
+this inbox bounced, this number complained. That is the right shape for
+deliverability and the wrong shape for consent. "Stop emailing me" is
+almost never what a person means -- they mean stop emailing them about the
+thing they are tired of, while still telling them their password changed.
+
+A `Topic` is the unit that distinction needs, and a `Preference` is one
+recipient's answer about one topic. The decisions worth recording:
+
+- **Topics are the tenant's strings, validated but never normalised.**
+  What one deployment calls `marketing` another calls `newsletter`, so a
+  fixed enum would either be wrong for everyone or grow an
+  `Other(String)` variant that is a string with extra steps. Validation
+  is strict for a sharper version of the reason `IdempotencyKey`'s is:
+  preferences are stored keyed by topic and matched by topic on the
+  delivery path, so a spelling folded in one place and not another does
+  not surface as an error -- it surfaces as a message delivered to
+  somebody who opted out of exactly that message. `Marketing` is
+  therefore refused rather than lowercased.
+
+- **A notification with no topic is always delivered.** Preferences apply
+  only to messages that declared one, which makes the mechanism opt-in
+  per message rather than per deployment. Without that rule, adding
+  topics to a service would retroactively let a marketing opt-out silence
+  a password reset that was written years earlier.
+
+- **Silence means yes.** A topic nobody has expressed an opinion about is
+  deliverable. Under an opt-in default the first message a tenant sent
+  under a new topic would go nowhere, and every recipient already
+  consenting by other means would have to be migrated into consent they
+  had already given.
+
+- **Most specific wins, and specificity outranks recency.** A preference
+  naming a channel beats one covering every channel, which is the only
+  ordering under which "nothing about orders except the text messages" is
+  sayable at all -- under the opposite rule the wildcard block swallows
+  its own exception. Checking specificity before recency means a wildcard
+  written later cannot quietly undo a channel exception written earlier.
+  Resolution lives in `PreferenceSet`, a pure function over the rows, so
+  the worker, the API and the CLI cannot drift apart on it.
+
+- **The wildcard channel is stored as `*`, not NULL.** A NULL in a SQLite
+  primary key is not equal to itself, so a NULL-channel row could be
+  inserted twice and matched by neither the upsert nor the delete.
+  Nothing else can collide with `*`: `ChannelKind` has no such spelling
+  and `Topic` refuses a leading one.
+
+- **Setting `allowed` is not the same as deleting.** Setting it records
+  that the recipient said yes, which is what carves an exception out of a
+  broader block. Deleting returns them to having said nothing, which is
+  what undoing a mistaken import wants. `/preferences/resolve` reports
+  which of the two produced a verdict, since a preference centre has to
+  show the difference.
+
+- **An opt-out is terminal, and counted apart from a suppression.** The
+  recipient's answer is identical on every retry, so the notification
+  moves straight to the terminal `Suppressed` status rather than
+  spending its attempt budget rediscovering it. It is reported as
+  `opted_out` in the delivery log and in the metrics, because a rising
+  suppressed count is a deliverability story and a rising opted-out count
+  is a content story -- and they need different people to do different
+  things.
+
 ## Delivery lifecycle
 
 A notification moves through `DeliveryStatus` states one-directionally:
@@ -274,6 +349,13 @@ A notification the worker declined to attempt (rate limited, or its
 channel's circuit breaker open) travels the same `Sending -> Failed ->
 Queued` edge, but without incrementing `attempt_count` -- see
 `NotificationQueue::defer`.
+
+`Sending -> Suppressed` is the other terminal edge, taken when the
+address is on the tenant's suppression list or the recipient has opted
+out of the notification's topic. It is terminal rather than a failure
+because both answers are the same on every retry, and it is deliberately
+not `DeadLettered`, which is replayable -- replaying it would send to
+somebody who asked not to be sent to.
 
 `Pending` and `Queued` can also move to `Cancelled`. Terminal states
 (`Delivered`, `DeadLettered`, `Cancelled`) never transition further --
@@ -304,3 +386,6 @@ This file is updated as each part lands. Currently implemented:
       path)
 - [x] Idempotent submission (`IdempotencyKey`: `Idempotency-Key` header,
       by-key lookup, CLI)
+- [x] Delivery preferences (`Topic` + `Preference`: per-recipient,
+      per-topic, optionally per-channel, enforced on the delivery path,
+      with API and CLI)

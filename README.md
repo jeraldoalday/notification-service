@@ -14,8 +14,8 @@ Early and under active development. The domain model, configuration layer,
 SQLite storage layer, job queue, channel providers, worker process, HTTP
 API, notification templates, the `ns` admin CLI, Prometheus metrics,
 API-key authentication with per-tenant isolation, a per-attempt delivery
-history, a per-tenant suppression list and idempotent submission are all
-in place.
+history, a per-tenant suppression list, idempotent submission and
+per-recipient topic preferences are all in place.
 
 ## Workspace layout
 
@@ -71,6 +71,10 @@ database, and serves on `NS_SERVER_HOST:NS_SERVER_PORT` (default
 | GET    | `/suppressions?tenant_id=`   | List a tenant's suppressed addresses           |
 | GET    | `/suppressions/lookup?channel=&address=` | Whether one address is suppressed  |
 | DELETE | `/suppressions?channel=&address=` | Lift a suppression                        |
+| PUT    | `/preferences`               | Record a recipient's answer about one topic     |
+| GET    | `/preferences?recipient_id=`  | Everything one recipient has said              |
+| GET    | `/preferences/resolve?recipient_id=&topic=&channel=` | Whether one topic would be sent |
+| DELETE | `/preferences?recipient_id=&topic=` | Forget one recorded answer                |
 | POST   | `/api-keys`                  | Mint an API key for the caller's tenant (admin) |
 | GET    | `/api-keys`                  | List the caller's tenant's keys (admin)        |
 | DELETE | `/api-keys/{id}`             | Revoke a key (admin)                           |
@@ -201,7 +205,7 @@ The same is available on the host, through the CLI:
 
 ```sh
 ns notification submit --tenant $T --recipient $R --channel email \
-    --body "Your order shipped" --idempotency-key order-1041-shipped
+    --body "Your order shipped" --topic order-updates --idempotency-key order-1041-shipped
 ns notification by-key --tenant $T order-1041-shipped
 ```
 
@@ -285,6 +289,62 @@ the terminal `suppressed` status -- not `dead_lettered`, which is
 replayable, and replaying it would send to the address that asked not to
 be sent to.
 
+## Delivery preferences
+
+A suppression says an address is undeliverable. A **preference** says what
+a person actually wants:
+
+```sh
+curl -X PUT localhost:8080/preferences -H 'content-type: application/json' \
+     -H "Authorization: Bearer $K" \
+     -d '{"recipient_id": "...", "topic": "marketing", "setting": "blocked"}'
+```
+
+Submit a notification with a `topic` and the recipient's answer about that
+topic applies to it:
+
+```sh
+curl -X POST localhost:8080/notifications -H 'content-type: application/json' \
+     -H "Authorization: Bearer $K" \
+     -d '{"recipient_id": "...", "channel": "email", "topic": "marketing",
+          "body": "Our summer sale is on"}'
+```
+
+Submit one **without** a topic and nothing anyone has said applies to it.
+That is the point: "stop emailing me" is almost never what someone means,
+and a password reset must not be silenced by a marketing opt-out. Topics
+are lowercase slugs the tenant chooses (`order-updates`, `security.alerts`,
+`weekly_digest`) and are validated rather than normalised -- `Marketing` is
+refused rather than folded, because a folded spelling would match a
+different preference row than the one anybody meant.
+
+Omit `channel` and the answer covers every channel, including channels the
+deployment adds later; supply one and it covers only that channel. The
+more specific answer wins, so an exception is expressible:
+
+```sh
+# Nothing about orders -- except the text messages.
+ns preference set --tenant $T --recipient $R --topic orders --setting blocked
+ns preference set --tenant $T --recipient $R --topic orders --channel sms --setting allowed
+ns preference check --tenant $T --recipient $R --topic orders --channel sms
+```
+
+Silence means yes. A topic nobody has expressed an opinion about is
+delivered, because under an opt-in default the first message a tenant ever
+sent under a new topic would go nowhere. `/preferences/resolve` reports
+which preference decided a verdict, or `null` when the default did, so a
+preference centre can tell an explicit yes from silence.
+
+Like suppression, this is enforced twice: submitting a topic the recipient
+has opted out of is a `422` while the caller is still on the line, and the
+worker checks again before every send, since somebody can opt out after a
+notification is queued. A notification stopped this way ends in the
+terminal `suppressed` status, but is reported as `opted_out` in the
+delivery log and in `ns_notification_attempts_total` -- a rising
+suppression count is a deliverability problem, while a rising opt-out
+count means people are tired of a topic, and those call for different
+people to do different things.
+
 ## Templates
 
 Rather than inlining message text into every notification, store it once
@@ -325,7 +385,7 @@ ns recipient add --tenant $T --email ada@example.com --display-name "Ada Lovelac
 ns notification submit --tenant $T --recipient $R --channel email \
     --template order_shipped --var name=Ada --var order_id=1234
 ns notification submit --tenant $T --recipient $R --channel email \
-    --body "Your order shipped" --idempotency-key order-1041
+    --body "Your order shipped" --topic order-updates --idempotency-key order-1041
 ns notification by-key --tenant $T order-1041
 ns notification list --tenant $T --status dead_lettered
 ns notification attempts $N       # why did this one dead-letter?
@@ -335,6 +395,10 @@ ns queue purge-attempts --older-than-days 30
 ns suppression add --tenant $T --channel email ada@example.com --reason complaint
 ns suppression check --tenant $T --channel email ada@example.com
 ns suppression remove --tenant $T --channel email ada@example.com
+ns preference set --tenant $T --recipient $R --topic marketing --setting blocked
+ns preference list --tenant $T --recipient $R
+ns preference check --tenant $T --recipient $R --topic marketing --channel email
+ns preference clear --tenant $T --recipient $R --topic marketing
 ns template render --tenant $T order_shipped --var name=Ada
 ```
 
