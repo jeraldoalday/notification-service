@@ -214,10 +214,12 @@ impl<
     }
 
     /// Dispatches a single already-claimed (`Sending`) notification: checks
-    /// in two phases. First, whether it should be sent at all: it renders,
-    /// resolves the channel and the recipient's address, and checks that
-    /// address against the tenant's suppression list. Then, whether it can
-    /// be sent now: the circuit breaker and the rate limiter. Only then
+    /// in two phases. First, whether it should be sent at all: the
+    /// recipient's preferences for its topic, the channel registry, the
+    /// recipient's address, that address against the tenant's suppression
+    /// list, and finally whether the message can be rendered. Then,
+    /// whether it can be sent now: the circuit breaker and the rate
+    /// limiter. Only then
     /// does it send and report the outcome back to the queue and the
     /// circuit breaker. Every
     /// business-level failure (breaker open, rate limited, unregistered
@@ -235,21 +237,6 @@ impl<
         mut notification: Notification,
         now: DateTime<Utc>,
     ) -> WorkerResult<DispatchOutcome> {
-        // Rendering runs before the guards on purpose: a message that
-        // can't even be built is never going to reach the provider, so
-        // there's no reason to spend one of that channel's rate-limit
-        // tokens discovering that.
-        if let Err(err) = self.render_if_templated(&mut notification).await {
-            warn!(notification_id = %notification.id, error = %err, "could not render template");
-            // Logged as a skip rather than a failure even though it does
-            // spend an attempt: nothing reached a provider, and an
-            // operator scanning the log for a provider's health should not
-            // find this service's own rendering problem among the results.
-            self.log_skip(&notification, err.to_string(), now).await;
-            let failed = self.queue.fail(notification, now).await?;
-            return Ok(outcome_from_status(failed.status));
-        }
-
         // Checked before the channel registry and before the recipient is
         // loaded, because it needs neither: a notification carries its own
         // recipient id, topic and channel, which is everything the
@@ -331,6 +318,33 @@ impl<
                 .await;
             self.queue.suppress(notification, now).await?;
             return Ok(DispatchOutcome::Suppressed);
+        }
+
+        // Rendering is the last of the "should this be sent at all"
+        // checks, and it runs after the others rather than before them.
+        //
+        // It used to run first, on the reasoning that a message which
+        // can't be built will never reach a provider, so it shouldn't
+        // spend one of the channel's rate-limit tokens discovering that.
+        // That reasoning holds against the *guards* and still does --
+        // rendering stays ahead of the circuit breaker and the rate
+        // limiter below. It does not hold against the checks above:
+        // those decide that nothing will be sent at all, and running
+        // rendering first meant an unrenderable template attached to a
+        // suppressed address was reported as a failed attempt and
+        // retried until it dead-lettered, instead of being marked
+        // terminally suppressed. The tenant then saw a template error
+        // for a message that was never going out, and the suppression
+        // never appeared in the counts at all.
+        if let Err(err) = self.render_if_templated(&mut notification).await {
+            warn!(notification_id = %notification.id, error = %err, "could not render template");
+            // Logged as a skip rather than a failure even though it does
+            // spend an attempt: nothing reached a provider, and an
+            // operator scanning the log for a provider's health should not
+            // find this service's own rendering problem among the results.
+            self.log_skip(&notification, err.to_string(), now).await;
+            let failed = self.queue.fail(notification, now).await?;
+            return Ok(outcome_from_status(failed.status));
         }
 
         // Everything above decided whether this should be sent; the two
@@ -539,6 +553,91 @@ mod tests {
     }
 
     // -- preferences ---------------------------------------------------
+    /// A notification whose template can never be rendered, addressed to
+    /// somebody the tenant may not send to.
+    async fn seed_unrenderable_to_a_blocked_address(
+        repo: &SqliteStorage,
+    ) -> (Uuid, Uuid, RecipientAddress, Notification) {
+        let tenant_id = Uuid::new_v4();
+        let address = RecipientAddress::WebhookUrl("https://example.com/hook".into());
+        let recipient = Recipient::new(Uuid::new_v4(), tenant_id).with_address(address.clone()).unwrap();
+        repo.insert_recipient(&recipient).await.unwrap();
+
+        let notification = Notification::builder(tenant_id, recipient.id, ChannelKind::Webhook)
+            .template("no-such-template")
+            .topic(Topic::new("marketing").unwrap())
+            .max_attempts(3)
+            .build()
+            .unwrap();
+        let queue = NotificationQueue::new(repo.clone());
+        let submitted = queue.submit(notification, Utc::now()).await.unwrap();
+        (tenant_id, recipient.id, address, submitted)
+    }
+
+    #[tokio::test]
+    async fn a_suppressed_address_wins_over_an_unrenderable_template() {
+        // Rendering used to run first, so this dead-lettered as a template
+        // failure over several retries -- reporting a problem with a
+        // message that was never going out, and never counting the
+        // suppression that actually stopped it.
+        let (repo, _dir) = test_repo().await;
+        let (tenant, _recipient, address, submitted) = seed_unrenderable_to_a_blocked_address(&repo).await;
+        suppress_address(&repo, tenant, address).await;
+
+        let worker = Worker::new(
+            repo.clone(),
+            ChannelRegistry::new().register(ChannelKind::Webhook, Arc::new(FakeChannel::succeeding())),
+            RateLimiter::new(),
+            CircuitBreaker::disabled(),
+        )
+        .with_templates(Arc::new(repo.clone()));
+        let outcomes = worker.run_once(10).await.unwrap();
+
+        assert_eq!(outcomes[0].1, DispatchOutcome::Suppressed);
+        let stored = repo.get_notification(submitted.id).await.unwrap();
+        assert_eq!(stored.status, DeliveryStatus::Suppressed);
+        assert_eq!(stored.attempt_count, 0, "and it cost nothing to find out");
+    }
+
+    #[tokio::test]
+    async fn an_opt_out_wins_over_an_unrenderable_template() {
+        let (repo, _dir) = test_repo().await;
+        let (tenant, recipient, _address, submitted) = seed_unrenderable_to_a_blocked_address(&repo).await;
+        set_preference(&repo, &Preference::block(tenant, recipient, topic("marketing"), Utc::now())).await;
+
+        let worker = Worker::new(
+            repo.clone(),
+            ChannelRegistry::new().register(ChannelKind::Webhook, Arc::new(FakeChannel::succeeding())),
+            RateLimiter::new(),
+            CircuitBreaker::disabled(),
+        )
+        .with_templates(Arc::new(repo.clone()));
+        let outcomes = worker.run_once(10).await.unwrap();
+
+        assert_eq!(outcomes[0].1, DispatchOutcome::OptedOut);
+        assert_eq!(repo.get_notification(submitted.id).await.unwrap().attempt_count, 0);
+    }
+
+    #[tokio::test]
+    async fn an_unrenderable_template_still_fails_when_the_message_was_deliverable() {
+        // The other half of the ordering: rendering is still ahead of the
+        // guards, and a message nothing else refused still fails on a
+        // template it cannot build.
+        let (repo, _dir) = test_repo().await;
+        let (_tenant, _recipient, _address, submitted) = seed_unrenderable_to_a_blocked_address(&repo).await;
+
+        let worker = Worker::new(
+            repo.clone(),
+            ChannelRegistry::new().register(ChannelKind::Webhook, Arc::new(FakeChannel::succeeding())),
+            RateLimiter::new(),
+            CircuitBreaker::disabled(),
+        )
+        .with_templates(Arc::new(repo.clone()));
+        let outcomes = worker.run_once(10).await.unwrap();
+
+        assert_eq!(outcomes[0].1, DispatchOutcome::Failed);
+        assert_eq!(repo.get_notification(submitted.id).await.unwrap().attempt_count, 1);
+    }
 
     use ns_core::{Preference, PreferenceSetting, Topic};
 
