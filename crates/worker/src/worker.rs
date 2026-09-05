@@ -5,8 +5,8 @@ use ns_core::{AttemptResult, DeliveryAttempt, DeliveryStatus, Notification};
 use ns_metrics::{AttemptOutcome, ServiceMetrics, SkipReason};
 use ns_queue::NotificationQueue;
 use ns_storage::{
-    DeliveryAttemptRepository, NotificationRepository, RecipientRepository, SuppressionRepository,
-    TemplateRepository,
+    DeliveryAttemptRepository, NotificationRepository, PreferenceRepository, RecipientRepository,
+    SuppressionRepository, TemplateRepository,
 };
 use tracing::{info, warn};
 
@@ -38,6 +38,11 @@ pub enum DispatchOutcome {
     /// The recipient's address is on the tenant's suppression list, so
     /// nothing was sent and the notification is terminally suppressed.
     Suppressed,
+    /// The recipient has opted out of this notification's topic, so
+    /// nothing was sent. Terminal, like `Suppressed`, and stored under
+    /// the same `DeliveryStatus` -- reported apart from it here because
+    /// the two say different things about why a message stopped.
+    OptedOut,
 }
 
 fn outcome_from_status(status: DeliveryStatus) -> DispatchOutcome {
@@ -59,6 +64,7 @@ impl DispatchOutcome {
             DispatchOutcome::Deferred => AttemptOutcome::Deferred,
             DispatchOutcome::DeadLettered => AttemptOutcome::DeadLettered,
             DispatchOutcome::Suppressed => AttemptOutcome::Suppressed,
+            DispatchOutcome::OptedOut => AttemptOutcome::OptedOut,
         }
     }
 }
@@ -90,15 +96,18 @@ pub struct Worker<R> {
     attempts: Option<Arc<dyn DeliveryAttemptRepository>>,
 }
 
-// SuppressionRepository is a bound on `R` rather than another optional
-// handle like `templates` or `metrics`, and the difference is deliberate.
-// A worker missing its template store fails the notifications that need
-// one, loudly; a worker missing its metrics handle records nothing and
-// costs nobody anything. A worker missing its suppression list would
-// silently send to every address that ever asked not to be contacted --
+// SuppressionRepository and PreferenceRepository are bounds on `R` rather
+// than optional handles like `templates` or `metrics`, and the difference
+// is deliberate. A worker missing its template store fails the
+// notifications that need one, loudly; a worker missing its metrics handle
+// records nothing and costs nobody anything. A worker missing either of
+// these two would silently send to people who asked not to be contacted --
 // the one failure mode here that is worse than not running at all. Making
-// it a bound means a deployment cannot forget to wire it.
-impl<R: NotificationRepository + RecipientRepository + SuppressionRepository + Clone> Worker<R> {
+// them bounds means a deployment cannot forget to wire them.
+impl<
+        R: NotificationRepository + RecipientRepository + SuppressionRepository + PreferenceRepository + Clone,
+    > Worker<R>
+{
     pub fn new(
         repo: R,
         channels: ChannelRegistry,
@@ -239,6 +248,41 @@ impl<R: NotificationRepository + RecipientRepository + SuppressionRepository + C
             self.log_skip(&notification, err.to_string(), now).await;
             let failed = self.queue.fail(notification, now).await?;
             return Ok(outcome_from_status(failed.status));
+        }
+
+        // Checked before the channel registry and before the recipient is
+        // loaded, because it needs neither: a notification carries its own
+        // recipient id, topic and channel, which is everything the
+        // question takes. A message the recipient asked not to receive
+        // should not cost a recipient read to discover that.
+        //
+        // Untopiced notifications skip this entirely -- there is nothing
+        // for anyone to have opted out of -- which is what keeps a
+        // password reset deliverable to someone who unsubscribed from the
+        // newsletter.
+        if let Some(topic) = notification.topic.clone() {
+            let preferences =
+                self.repo.preferences_for(notification.tenant_id, notification.recipient_id, &topic).await?;
+            if !preferences.allows(notification.channel) {
+                info!(
+                    notification_id = %notification.id,
+                    topic = %topic,
+                    "recipient has opted out of this topic, not sending"
+                );
+                self.log_skip(
+                    &notification,
+                    format!("recipient has opted out of topic `{topic}` on {}", notification.channel),
+                    now,
+                )
+                .await;
+                // Terminal via `suppress`, not `fail`: the recipient's
+                // answer will be exactly the same on every retry, so
+                // spending the attempt budget rediscovering it would fill
+                // the dead-letter queue with messages that were never
+                // going to go out.
+                self.queue.suppress(notification, now).await?;
+                return Ok(DispatchOutcome::OptedOut);
+            }
         }
 
         let Some(channel) = self.channels.get(notification.channel) else {
@@ -492,6 +536,203 @@ mod tests {
             .build()
             .unwrap();
         queue.submit(notification, Utc::now()).await.unwrap()
+    }
+
+    // -- preferences ---------------------------------------------------
+
+    use ns_core::{Preference, PreferenceSetting, Topic};
+
+    fn topic(raw: &str) -> Topic {
+        Topic::new(raw).unwrap()
+    }
+
+    async fn set_preference(repo: &SqliteStorage, preference: &Preference) {
+        ns_storage::PreferenceRepository::set_preference(repo, preference).await.unwrap();
+    }
+
+    /// A recipient plus one queued notification carrying `topic`, sharing
+    /// a tenant, so a preference set for that recipient covers the send.
+    async fn seed_topical(
+        repo: &SqliteStorage,
+        channel: ChannelKind,
+        topic: Option<Topic>,
+    ) -> (Uuid, Uuid, Notification) {
+        let tenant_id = Uuid::new_v4();
+        let address = match channel {
+            ChannelKind::Email => RecipientAddress::Email("ada@example.com".into()),
+            ChannelKind::Sms => RecipientAddress::Phone("+15555550100".into()),
+            ChannelKind::Push => RecipientAddress::PushToken("device-token".into()),
+            ChannelKind::Webhook => RecipientAddress::WebhookUrl("https://example.com/hook".into()),
+        };
+        let recipient = Recipient::new(Uuid::new_v4(), tenant_id).with_address(address).unwrap();
+        repo.insert_recipient(&recipient).await.unwrap();
+
+        let mut builder =
+            Notification::builder(tenant_id, recipient.id, channel).body("hello").max_attempts(3);
+        if let Some(topic) = topic {
+            builder = builder.topic(topic);
+        }
+        let queue = NotificationQueue::new(repo.clone());
+        let submitted = queue.submit(builder.build().unwrap(), Utc::now()).await.unwrap();
+        (tenant_id, recipient.id, submitted)
+    }
+
+    fn webhook_worker(repo: &SqliteStorage, channel: Arc<FakeChannel>) -> Worker<SqliteStorage> {
+        let registry = ChannelRegistry::new().register(ChannelKind::Webhook, channel as _);
+        Worker::new(repo.clone(), registry, RateLimiter::new(), CircuitBreaker::disabled())
+    }
+
+    #[tokio::test]
+    async fn a_topic_the_recipient_opted_out_of_is_never_sent() {
+        let (repo, _dir) = test_repo().await;
+        let (tenant, recipient, submitted) =
+            seed_topical(&repo, ChannelKind::Webhook, Some(topic("marketing"))).await;
+        set_preference(&repo, &Preference::block(tenant, recipient, topic("marketing"), Utc::now())).await;
+
+        let channel = Arc::new(FakeChannel::succeeding());
+        let outcomes = webhook_worker(&repo, Arc::clone(&channel)).run_once(10).await.unwrap();
+
+        assert_eq!(outcomes[0].1, DispatchOutcome::OptedOut);
+        assert_eq!(channel.calls.load(Ordering::SeqCst), 0, "the provider was never contacted");
+        assert_eq!(repo.get_notification(submitted.id).await.unwrap().status, DeliveryStatus::Suppressed);
+    }
+
+    #[tokio::test]
+    async fn an_opt_out_spends_no_attempt_and_never_comes_back() {
+        // The recipient's answer is the same on every retry, so burning
+        // the attempt budget rediscovering it would only fill the
+        // dead-letter queue.
+        let (repo, _dir) = test_repo().await;
+        let (tenant, recipient, submitted) =
+            seed_topical(&repo, ChannelKind::Webhook, Some(topic("marketing"))).await;
+        set_preference(&repo, &Preference::block(tenant, recipient, topic("marketing"), Utc::now())).await;
+
+        let worker = webhook_worker(&repo, Arc::new(FakeChannel::succeeding()));
+        worker.run_once(10).await.unwrap();
+
+        assert_eq!(repo.get_notification(submitted.id).await.unwrap().attempt_count, 0);
+        assert!(worker.run_once(10).await.unwrap().is_empty(), "and it is not claimable again");
+    }
+
+    #[tokio::test]
+    async fn a_notification_with_no_topic_ignores_every_preference() {
+        // The property that keeps a password reset deliverable to someone
+        // who unsubscribed from the newsletter.
+        let (repo, _dir) = test_repo().await;
+        let (tenant, recipient, submitted) = seed_topical(&repo, ChannelKind::Webhook, None).await;
+        set_preference(&repo, &Preference::block(tenant, recipient, topic("marketing"), Utc::now())).await;
+
+        webhook_worker(&repo, Arc::new(FakeChannel::succeeding())).run_once(10).await.unwrap();
+
+        assert_eq!(repo.get_notification(submitted.id).await.unwrap().status, DeliveryStatus::Delivered);
+    }
+
+    #[tokio::test]
+    async fn opting_out_of_one_topic_leaves_the_others_alone() {
+        let (repo, _dir) = test_repo().await;
+        let (tenant, recipient, submitted) =
+            seed_topical(&repo, ChannelKind::Webhook, Some(topic("receipts"))).await;
+        set_preference(&repo, &Preference::block(tenant, recipient, topic("marketing"), Utc::now())).await;
+
+        webhook_worker(&repo, Arc::new(FakeChannel::succeeding())).run_once(10).await.unwrap();
+
+        assert_eq!(repo.get_notification(submitted.id).await.unwrap().status, DeliveryStatus::Delivered);
+    }
+
+    #[tokio::test]
+    async fn a_channel_exception_survives_a_wildcard_block_on_the_delivery_path() {
+        // The precedence rule, exercised through storage rather than only
+        // over a hand-built set: the two rows have to survive the round
+        // trip and still resolve the same way.
+        let (repo, _dir) = test_repo().await;
+        let (tenant, recipient, submitted) =
+            seed_topical(&repo, ChannelKind::Webhook, Some(topic("orders"))).await;
+        set_preference(&repo, &Preference::block(tenant, recipient, topic("orders"), Utc::now())).await;
+        set_preference(
+            &repo,
+            &Preference::allow_on(tenant, recipient, topic("orders"), ChannelKind::Webhook, Utc::now()),
+        )
+        .await;
+
+        webhook_worker(&repo, Arc::new(FakeChannel::succeeding())).run_once(10).await.unwrap();
+
+        assert_eq!(repo.get_notification(submitted.id).await.unwrap().status, DeliveryStatus::Delivered);
+    }
+
+    #[tokio::test]
+    async fn a_preference_on_another_channel_does_not_stop_this_one() {
+        let (repo, _dir) = test_repo().await;
+        let (tenant, recipient, submitted) =
+            seed_topical(&repo, ChannelKind::Webhook, Some(topic("orders"))).await;
+        set_preference(
+            &repo,
+            &Preference::new(
+                tenant,
+                recipient,
+                topic("orders"),
+                Some(ChannelKind::Email),
+                PreferenceSetting::Blocked,
+                Utc::now(),
+            ),
+        )
+        .await;
+
+        webhook_worker(&repo, Arc::new(FakeChannel::succeeding())).run_once(10).await.unwrap();
+
+        assert_eq!(repo.get_notification(submitted.id).await.unwrap().status, DeliveryStatus::Delivered);
+    }
+
+    #[tokio::test]
+    async fn another_recipients_opt_out_does_not_apply() {
+        let (repo, _dir) = test_repo().await;
+        let (tenant, _recipient, submitted) =
+            seed_topical(&repo, ChannelKind::Webhook, Some(topic("marketing"))).await;
+        set_preference(&repo, &Preference::block(tenant, Uuid::new_v4(), topic("marketing"), Utc::now()))
+            .await;
+
+        webhook_worker(&repo, Arc::new(FakeChannel::succeeding())).run_once(10).await.unwrap();
+
+        assert_eq!(repo.get_notification(submitted.id).await.unwrap().status, DeliveryStatus::Delivered);
+    }
+
+    #[tokio::test]
+    async fn an_opted_out_dispatch_is_recorded_in_the_history_with_its_topic() {
+        let (repo, _dir) = test_repo().await;
+        let (tenant, recipient, submitted) =
+            seed_topical(&repo, ChannelKind::Webhook, Some(topic("marketing"))).await;
+        set_preference(&repo, &Preference::block(tenant, recipient, topic("marketing"), Utc::now())).await;
+
+        let registry =
+            ChannelRegistry::new().register(ChannelKind::Webhook, Arc::new(FakeChannel::succeeding()));
+        logging_worker(&repo, registry).run_once(10).await.unwrap();
+
+        let attempts =
+            ns_storage::DeliveryAttemptRepository::list_attempts(&repo, submitted.id, 10).await.unwrap();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].result, ns_core::AttemptResult::Skipped);
+        let error = attempts[0].error.clone().unwrap();
+        assert!(error.contains("opted out") && error.contains("marketing"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_opt_out_is_counted_as_its_own_outcome() {
+        let (repo, _dir) = test_repo().await;
+        let (tenant, recipient, _submitted) =
+            seed_topical(&repo, ChannelKind::Webhook, Some(topic("marketing"))).await;
+        set_preference(&repo, &Preference::block(tenant, recipient, topic("marketing"), Utc::now())).await;
+
+        let metrics = Arc::new(ns_metrics::ServiceMetrics::new());
+        let registry =
+            ChannelRegistry::new().register(ChannelKind::Webhook, Arc::new(FakeChannel::succeeding()));
+        let worker = Worker::new(repo.clone(), registry, RateLimiter::new(), CircuitBreaker::disabled())
+            .with_metrics(Arc::clone(&metrics));
+        worker.run_once(10).await.unwrap();
+
+        let text = metrics.render();
+        assert!(
+            text.contains("ns_notification_attempts_total{channel=\"webhook\",outcome=\"opted_out\"} 1"),
+            "{text}"
+        );
     }
 
     // -- suppression ---------------------------------------------------
