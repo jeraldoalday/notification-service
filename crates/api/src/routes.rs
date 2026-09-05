@@ -9,6 +9,7 @@ use crate::state::{AppState, Repositories};
 pub mod api_keys;
 mod health;
 pub mod notifications;
+pub mod preferences;
 pub mod recipients;
 pub mod suppressions;
 pub mod templates;
@@ -64,6 +65,13 @@ where
                 .delete(suppressions::delete_suppression),
         )
         .route("/suppressions/lookup", get(suppressions::get_suppression))
+        .route(
+            "/preferences",
+            axum::routing::put(preferences::set_preference)
+                .get(preferences::list_preferences)
+                .delete(preferences::delete_preference),
+        )
+        .route("/preferences/resolve", get(preferences::resolve_preference))
         .route("/api-keys", post(api_keys::create_api_key).get(api_keys::list_api_keys))
         .route("/api-keys/{id}", axum::routing::delete(api_keys::revoke_api_key))
         // route_layer, so a request for an unknown path is a plain 404
