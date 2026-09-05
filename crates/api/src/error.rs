@@ -46,6 +46,18 @@ pub enum ApiError {
     #[error("recipient's {reason} address is suppressed for this tenant")]
     Suppressed { reason: ns_core::SuppressionReason },
 
+    /// The recipient has opted out of this notification's topic on this
+    /// channel.
+    ///
+    /// 422 for the same reason `Suppressed` is: the request was
+    /// well-formed and the caller was entitled to make it, the service
+    /// simply won't act on it. Reported separately from `Suppressed`
+    /// because the remedy is different -- a suppressed address needs an
+    /// operator, while an opt-out is the recipient's own decision and the
+    /// only thing that can undo it is the recipient changing their mind.
+    #[error("recipient has opted out of topic `{topic}` on {channel}")]
+    OptedOut { topic: ns_core::Topic, channel: ns_core::ChannelKind },
+
     /// The caller reused an idempotency key for a different message.
     ///
     /// 409 rather than 200-with-the-original: the two requests disagree
@@ -172,7 +184,7 @@ impl IntoResponse for ApiError {
             ApiError::Template(err) => status_for_template(err),
             ApiError::NotFound(_) => StatusCode::NOT_FOUND,
             ApiError::BadRequest(_) => StatusCode::BAD_REQUEST,
-            ApiError::Suppressed { .. } => StatusCode::UNPROCESSABLE_ENTITY,
+            ApiError::Suppressed { .. } | ApiError::OptedOut { .. } => StatusCode::UNPROCESSABLE_ENTITY,
             ApiError::IdempotencyConflict { .. } => StatusCode::CONFLICT,
             ApiError::Auth(err) => status_for_auth(err),
             ApiError::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,

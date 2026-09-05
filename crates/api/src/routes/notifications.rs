@@ -9,6 +9,7 @@ use chrono::{DateTime, Utc};
 use ns_auth::Scope;
 use ns_core::{
     AttemptResult, ChannelKind, DeliveryAttempt, DeliveryStatus, IdempotencyKey, Notification, Priority,
+    Topic,
 };
 use ns_metrics::ServiceMetrics;
 use ns_queue::Submission;
@@ -136,6 +137,11 @@ pub struct SubmitNotificationRequest {
     pub template_id: Option<String>,
     #[serde(default)]
     pub template_vars: HashMap<String, String>,
+    /// What this message is about, so the recipient's preferences for
+    /// that topic apply to it. Omitting it means nobody has been given
+    /// the chance to opt out, and the message is delivered whatever they
+    /// have said about anything else.
+    pub topic: Option<Topic>,
     pub max_attempts: Option<u32>,
     pub scheduled_for: Option<DateTime<Utc>>,
 }
@@ -149,6 +155,11 @@ pub struct NotificationResponse {
     pub priority: Priority,
     pub status: DeliveryStatus,
     pub subject: Option<String>,
+    /// Echoed back so a caller can see which preferences this message is
+    /// subject to. Absent rather than null when the caller sent none, so
+    /// "no topic" and "a topic named null" can't be confused.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub topic: Option<Topic>,
     /// Echoed back so a caller can confirm the key it sent is the key the
     /// service stored, and so the notification a later lookup returns
     /// carries the name the caller knows it by.
@@ -171,6 +182,7 @@ impl From<Notification> for NotificationResponse {
             priority: n.priority,
             status: n.status,
             subject: n.subject,
+            topic: n.topic,
             idempotency_key: n.idempotency_key,
             attempt_count: n.attempt_count,
             max_attempts: n.max_attempts,
@@ -220,6 +232,9 @@ fn build_notification(
     for (name, value) in &request.template_vars {
         builder = builder.template_var(name.clone(), value.clone());
     }
+    if let Some(topic) = &request.topic {
+        builder = builder.topic(topic.clone());
+    }
     if let Some(key) = key {
         builder = builder.idempotency_key(key);
     }
@@ -268,7 +283,8 @@ fn idempotent_replay(
 /// never be delivered should be rejected here, synchronously, rather than
 /// being accepted, retried on backoff until its attempts run out and
 /// dead-lettered minutes later where nobody is watching. So an unknown
-/// recipient is a 404, a suppressed address is a 422, and a `template_id`
+/// recipient is a 404, a suppressed address is a 422, a topic the
+/// recipient has opted out of is a 422, and a `template_id`
 /// is resolved and test-rendered against the supplied `template_vars`
 /// before the notification is queued.
 ///
@@ -279,9 +295,9 @@ fn idempotent_replay(
 ///
 /// A submission resolved by its idempotency key skips all of it. Those
 /// checks describe the message that was already accepted, and re-running
-/// them would let a retry fail over a recipient deleted or an address
-/// suppressed since -- turning the one call that exists to make retrying
-/// safe into the one call that punishes it.
+/// them would let a retry fail over a recipient deleted, an address
+/// suppressed or a topic opted out of since -- turning the one call that
+/// exists to make retrying safe into the one call that punishes it.
 pub async fn submit_notification<R>(
     State(state): State<AppState<R>>,
     caller: Caller,
@@ -330,6 +346,18 @@ where
     if let Ok(address) = recipient.address_for(request.channel) {
         if let Some(suppression) = state.repo.find_suppression(tenant_id, address).await? {
             return Err(ApiError::Suppressed { reason: suppression.reason });
+        }
+    }
+
+    // Same rationale as the suppression check above, and the same
+    // division of labour: this is the courteous answer while the caller
+    // is still on the line, and the worker's check is the authoritative
+    // one, since a recipient can opt out between this moment and the
+    // send.
+    if let Some(topic) = &candidate.topic {
+        let preferences = state.repo.preferences_for(tenant_id, request.recipient_id, topic).await?;
+        if !preferences.allows(request.channel) {
+            return Err(ApiError::OptedOut { topic: topic.clone(), channel: request.channel });
         }
     }
 
