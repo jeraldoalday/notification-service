@@ -28,6 +28,18 @@ pub enum AttemptOutcome {
     /// -- a rising suppressed count is a list doing its job, not an
     /// incident.
     Suppressed,
+    /// The recipient had opted out of this notification's topic, so
+    /// nothing was sent.
+    ///
+    /// Split from `Suppressed` even though both end the same way, because
+    /// the two answer different questions. A rising suppressed count is
+    /// about deliverability -- bounces, complaints, an address going bad
+    /// -- and belongs next to a provider's health. A rising opted-out
+    /// count is about content: people are tired of a particular topic,
+    /// and whoever owns that topic is the one who needs to know. Folding
+    /// them together would leave a tenant unable to tell a campaign
+    /// nobody wants from a domain reputation problem.
+    OptedOut,
 }
 
 impl AttemptOutcome {
@@ -38,12 +50,13 @@ impl AttemptOutcome {
             AttemptOutcome::Deferred => "deferred",
             AttemptOutcome::DeadLettered => "dead_lettered",
             AttemptOutcome::Suppressed => "suppressed",
+            AttemptOutcome::OptedOut => "opted_out",
         }
     }
 
-    pub fn all() -> [AttemptOutcome; 5] {
+    pub fn all() -> [AttemptOutcome; 6] {
         use AttemptOutcome::*;
-        [Delivered, Failed, Deferred, DeadLettered, Suppressed]
+        [Delivered, Failed, Deferred, DeadLettered, Suppressed, OptedOut]
     }
 }
 
@@ -318,6 +331,35 @@ mod tests {
                 );
                 assert!(text.contains(&expected), "missing series: {expected}");
             }
+        }
+    }
+
+    #[test]
+    fn an_opt_out_is_counted_apart_from_a_suppression() {
+        // Both stop a send, but one is a deliverability problem and the
+        // other is people being tired of a topic. A single counter would
+        // leave a tenant unable to tell those apart.
+        let metrics = ServiceMetrics::new();
+        metrics.record_attempt(ChannelKind::Email, AttemptOutcome::OptedOut);
+        metrics.record_attempt(ChannelKind::Email, AttemptOutcome::Suppressed);
+        metrics.record_attempt(ChannelKind::Email, AttemptOutcome::OptedOut);
+
+        let text = metrics.render();
+        assert!(
+            text.contains("ns_notification_attempts_total{channel=\"email\",outcome=\"opted_out\"} 2"),
+            "{text}"
+        );
+        assert!(
+            text.contains("ns_notification_attempts_total{channel=\"email\",outcome=\"suppressed\"} 1"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn every_outcome_has_a_distinct_label() {
+        let mut seen = std::collections::HashSet::new();
+        for outcome in AttemptOutcome::all() {
+            assert!(seen.insert(outcome.as_str()), "duplicate label {}", outcome.as_str());
         }
     }
 
