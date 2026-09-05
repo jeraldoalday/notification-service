@@ -224,12 +224,7 @@ impl NotificationRepository for SqliteStorage {
         .fetch_all(&self.pool)
         .await?;
 
-        rows.into_iter()
-            .map(|row| {
-                let data: String = row.try_get("data")?;
-                Ok(serde_json::from_str(&data)?)
-            })
-            .collect()
+        decode_all(rows)
     }
 
     async fn list_by_tenant(
@@ -266,12 +261,7 @@ impl NotificationRepository for SqliteStorage {
             }
         };
 
-        rows.into_iter()
-            .map(|row| {
-                let data: String = row.try_get("data")?;
-                Ok(serde_json::from_str(&data)?)
-            })
-            .collect()
+        decode_all(rows)
     }
 
     async fn count_by_status(&self, tenant_id: Option<Uuid>) -> StorageResult<HashMap<DeliveryStatus, u64>> {
@@ -401,12 +391,7 @@ impl TemplateRepository for SqliteStorage {
             .fetch_all(&self.pool)
             .await?;
 
-        rows.into_iter()
-            .map(|row| {
-                let data: String = row.try_get("data")?;
-                Ok(serde_json::from_str(&data)?)
-            })
-            .collect()
+        decode_all(rows)
     }
 
     async fn delete_template(&self, tenant_id: Uuid, id: &str) -> StorageResult<()> {
@@ -475,12 +460,7 @@ impl ApiKeyRepository for SqliteStorage {
         .fetch_all(&self.pool)
         .await?;
 
-        rows.into_iter()
-            .map(|row| {
-                let data: String = row.try_get("data")?;
-                Ok(serde_json::from_str(&data)?)
-            })
-            .collect()
+        decode_all(rows)
     }
 
     async fn update_api_key(&self, key: &ApiKey) -> StorageResult<()> {
@@ -540,7 +520,7 @@ impl DeliveryAttemptRepository for SqliteStorage {
         .fetch_all(&self.pool)
         .await?;
 
-        decode_attempts(rows)
+        decode_all(rows)
     }
 
     async fn list_tenant_attempts(&self, tenant_id: Uuid, limit: u32) -> StorageResult<Vec<DeliveryAttempt>> {
@@ -555,7 +535,7 @@ impl DeliveryAttemptRepository for SqliteStorage {
         .fetch_all(&self.pool)
         .await?;
 
-        decode_attempts(rows)
+        decode_all(rows)
     }
 
     async fn purge_attempts_before(&self, cutoff: DateTime<Utc>) -> StorageResult<u64> {
@@ -573,20 +553,13 @@ impl DeliveryAttemptRepository for SqliteStorage {
 
 /// Reads a `data` column back into whatever entity it holds.
 ///
-/// Every table here stores its entity as a JSON document in `data`, so
-/// every listing ends with the same three lines. Written once and generic
-/// over the entity rather than copied per repository.
+/// Every table here stores its entity as a JSON document in a `data`
+/// column, so every listing ended with the same three lines -- once per
+/// repository, plus a `decode_attempts` that was the same function again
+/// with a concrete type. Written once and generic over the entity
+/// instead: the type is always inferred from the return position, so no
+/// call site is longer for it.
 fn decode_all<T: serde::de::DeserializeOwned>(rows: Vec<sqlx::sqlite::SqliteRow>) -> StorageResult<Vec<T>> {
-    rows.into_iter()
-        .map(|row| {
-            let data: String = row.try_get("data")?;
-            Ok(serde_json::from_str(&data)?)
-        })
-        .collect()
-}
-
-/// Shared by the two attempt listings, which differ only in their ORDER BY.
-fn decode_attempts(rows: Vec<sqlx::sqlite::SqliteRow>) -> StorageResult<Vec<DeliveryAttempt>> {
     rows.into_iter()
         .map(|row| {
             let data: String = row.try_get("data")?;
@@ -661,12 +634,7 @@ impl SuppressionRepository for SqliteStorage {
         .fetch_all(&self.pool)
         .await?;
 
-        rows.into_iter()
-            .map(|row| {
-                let data: String = row.try_get("data")?;
-                Ok(serde_json::from_str(&data)?)
-            })
-            .collect()
+        decode_all(rows)
     }
 
     async fn delete_suppression(&self, tenant_id: Uuid, address: &RecipientAddress) -> StorageResult<bool> {
