@@ -29,6 +29,7 @@ fn args(tenant_id: Uuid, recipient_id: Uuid, key: Option<&str>) -> SubmitArgs {
         body: Some("Hello there".into()),
         template_id: None,
         template_vars: HashMap::new(),
+        topic: None,
         idempotency_key: key.map(|k| IdempotencyKey::new(k).unwrap()),
         max_attempts: None,
         scheduled_for: None,

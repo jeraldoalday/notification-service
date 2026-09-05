@@ -53,6 +53,14 @@ pub enum Command {
     #[command(subcommand)]
     Suppression(SuppressionCommand),
 
+    /// Manage what each recipient has asked to be sent, per topic.
+    ///
+    /// Distinct from `suppression`, which is about an address being
+    /// undeliverable. This is about a person's choice: keep the receipts,
+    /// stop the newsletter.
+    #[command(subcommand)]
+    Preference(PreferenceCommand),
+
     /// Mint, list and revoke the API keys the HTTP API authenticates.
     ///
     /// This lives in the CLI rather than only behind an admin-scoped
@@ -90,6 +98,77 @@ pub enum ApikeyCommand {
 
     /// Revoke a key, so it stops authenticating immediately.
     Revoke { id: Uuid },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PreferenceCommand {
+    /// Record a recipient's answer about one topic. Re-running with a
+    /// different setting replaces the answer rather than failing.
+    Set {
+        #[arg(long)]
+        tenant: Uuid,
+
+        #[arg(long)]
+        recipient: Uuid,
+
+        #[arg(long, value_parser = parse::topic)]
+        topic: ns_core::Topic,
+
+        /// Narrow the answer to one channel. Omit it to cover every
+        /// channel, including ones this deployment adds later.
+        #[arg(long, value_parser = parse::channel)]
+        channel: Option<ChannelKind>,
+
+        #[arg(long, value_parser = parse::preference_setting)]
+        setting: ns_core::PreferenceSetting,
+    },
+
+    /// List everything one recipient has said, most recent first.
+    List {
+        #[arg(long)]
+        tenant: Uuid,
+
+        #[arg(long)]
+        recipient: Uuid,
+
+        #[arg(long, default_value_t = 50)]
+        limit: u32,
+    },
+
+    /// Answer whether one topic would be sent on one channel, and say
+    /// which preference decided it.
+    Check {
+        #[arg(long)]
+        tenant: Uuid,
+
+        #[arg(long)]
+        recipient: Uuid,
+
+        #[arg(long, value_parser = parse::topic)]
+        topic: ns_core::Topic,
+
+        #[arg(long, value_parser = parse::channel)]
+        channel: ChannelKind,
+    },
+
+    /// Forget one recorded answer, returning the recipient to having said
+    /// nothing about it.
+    ///
+    /// Not the same as setting it to `allowed`: that records a decision,
+    /// which is what carves an exception out of a broader block.
+    Clear {
+        #[arg(long)]
+        tenant: Uuid,
+
+        #[arg(long)]
+        recipient: Uuid,
+
+        #[arg(long, value_parser = parse::topic)]
+        topic: ns_core::Topic,
+
+        #[arg(long, value_parser = parse::channel)]
+        channel: Option<ChannelKind>,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -333,6 +412,12 @@ pub struct SubmitArgs {
     /// A template variable, as name=value. Repeat for each one.
     #[arg(long = "var", value_parser = parse::key_value)]
     pub vars: Vec<(String, String)>,
+
+    /// What this message is about, so the recipient's preferences for
+    /// that topic apply to it. Omit it and the message goes out whatever
+    /// they have opted out of.
+    #[arg(long, value_parser = parse::topic)]
+    pub topic: Option<ns_core::Topic>,
 
     /// Name this submission, so re-running the same command resolves to
     /// the notification the first run created instead of sending a

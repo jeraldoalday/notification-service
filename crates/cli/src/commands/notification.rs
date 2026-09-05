@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
-use ns_core::{ChannelKind, DeliveryAttempt, DeliveryStatus, IdempotencyKey, Notification, Priority};
+use ns_core::{ChannelKind, DeliveryAttempt, DeliveryStatus, IdempotencyKey, Notification, Priority, Topic};
 use ns_queue::NotificationQueue;
 use ns_storage::{
-    DeliveryAttemptRepository, NotificationRepository, RecipientRepository, SqliteStorage,
-    SuppressionRepository, TemplateRepository,
+    DeliveryAttemptRepository, NotificationRepository, PreferenceRepository, RecipientRepository,
+    SqliteStorage, SuppressionRepository, TemplateRepository,
 };
 use uuid::Uuid;
 
@@ -25,6 +25,7 @@ pub struct SubmitArgs {
     pub body: Option<String>,
     pub template_id: Option<String>,
     pub template_vars: HashMap<String, String>,
+    pub topic: Option<Topic>,
     pub idempotency_key: Option<IdempotencyKey>,
     pub max_attempts: Option<u32>,
     pub scheduled_for: Option<DateTime<Utc>>,
@@ -73,6 +74,22 @@ pub async fn submit(storage: &SqliteStorage, args: SubmitArgs, output: OutputFor
         }
     }
 
+    // And, if the message carries a topic, the recipient has to still
+    // want it. Same division of labour as the suppression check above:
+    // the worker checks again before the send, and this is only so the
+    // operator finds out now rather than reading `suppressed` off a
+    // status a minute later and having to work out which of the two
+    // reasons it meant.
+    if let Some(topic) = &args.topic {
+        let preferences = storage.preferences_for(args.tenant_id, args.recipient_id, topic).await?;
+        if !preferences.allows(args.channel) {
+            return Err(CliError::Invalid(format!(
+                "recipient {} has opted out of topic `{topic}` on {}",
+                args.recipient_id, args.channel
+            )));
+        }
+    }
+
     let mut builder =
         Notification::builder(args.tenant_id, args.recipient_id, args.channel).priority(args.priority);
     if let Some(subject) = args.subject {
@@ -86,6 +103,9 @@ pub async fn submit(storage: &SqliteStorage, args: SubmitArgs, output: OutputFor
     }
     for (key, value) in args.template_vars {
         builder = builder.template_var(key, value);
+    }
+    if let Some(topic) = args.topic.clone() {
+        builder = builder.topic(topic);
     }
     if let Some(key) = args.idempotency_key {
         builder = builder.idempotency_key(key);

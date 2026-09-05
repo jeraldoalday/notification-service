@@ -1,6 +1,7 @@
 use clap::Parser;
 use ns_cli::cli::{
-    ApikeyCommand, QueueCommand, RecipientCommand, SuppressionCommand, TemplateCommand, TemplateSaveArgs,
+    ApikeyCommand, PreferenceCommand, QueueCommand, RecipientCommand, SuppressionCommand, TemplateCommand,
+    TemplateSaveArgs,
 };
 use ns_cli::cli::{Cli, Command, NotificationCommand, SubmitArgs};
 use ns_cli::commands;
@@ -110,6 +111,19 @@ async fn run() -> CliResult<()> {
         Command::Suppression(SuppressionCommand::Remove { tenant, channel, address }) => {
             commands::suppression::remove(&storage, tenant, channel, address, cli.output).await?
         }
+        Command::Preference(PreferenceCommand::Set { tenant, recipient, topic, channel, setting }) => {
+            commands::preference::set(&storage, tenant, recipient, topic, channel, setting, cli.output)
+                .await?
+        }
+        Command::Preference(PreferenceCommand::List { tenant, recipient, limit }) => {
+            commands::preference::list(&storage, tenant, recipient, limit, cli.output).await?
+        }
+        Command::Preference(PreferenceCommand::Check { tenant, recipient, topic, channel }) => {
+            commands::preference::check(&storage, tenant, recipient, topic, channel, cli.output).await?
+        }
+        Command::Preference(PreferenceCommand::Clear { tenant, recipient, topic, channel }) => {
+            commands::preference::clear(&storage, tenant, recipient, topic, channel, cli.output).await?
+        }
         Command::Apikey(ApikeyCommand::Create { tenant, name, scopes }) => {
             commands::apikey::create(&storage, tenant, name, scopes, cli.output).await?
         }
@@ -150,6 +164,7 @@ fn submit_args(args: SubmitArgs) -> CliResult<commands::notification::SubmitArgs
         body: args.body,
         template_id: args.template,
         template_vars: args.vars.into_iter().collect(),
+        topic: args.topic,
         idempotency_key: args.idempotency_key,
         max_attempts: args.max_attempts,
         scheduled_for: args.schedule.as_deref().map(parse_timestamp).transpose()?,

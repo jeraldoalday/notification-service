@@ -45,6 +45,20 @@ pub fn idempotency_key(raw: &str) -> Result<ns_core::IdempotencyKey, String> {
     raw.parse().map_err(|err: ns_core::CoreError| err.to_string())
 }
 
+/// Parses a `--topic` value through the domain's own validation, so the
+/// CLI accepts exactly the topics the HTTP API does. A topic accepted
+/// here but not there would let an operator record a preference that
+/// silently matches nothing a client can ever submit under.
+pub fn topic(raw: &str) -> Result<ns_core::Topic, String> {
+    raw.parse().map_err(|err: ns_core::CoreError| err.to_string())
+}
+
+/// Parses a `--setting` value. Forwards to the domain's own `FromStr`,
+/// whose error already names the accepted values.
+pub fn preference_setting(raw: &str) -> Result<ns_core::PreferenceSetting, String> {
+    raw.parse().map_err(|err: ns_core::CoreError| err.to_string())
+}
+
 pub fn priority(raw: &str) -> Result<Priority, String> {
     parse_enum(raw, &["low", "normal", "high", "critical"])
 }
@@ -101,6 +115,24 @@ mod tests {
         assert_eq!(idempotency_key("order-1041").unwrap().as_str(), "order-1041");
         assert!(idempotency_key("has spaces").is_err());
         assert!(idempotency_key("").is_err());
+    }
+
+    #[test]
+    fn parses_the_topics_the_api_accepts() {
+        assert_eq!(topic("order-updates").unwrap().as_str(), "order-updates");
+        // Refused here for the same reason the API refuses it: a folded
+        // spelling would match a different preference row than the one
+        // the operator meant.
+        assert!(topic("Marketing").is_err());
+        assert!(topic("order updates").is_err());
+    }
+
+    #[test]
+    fn parses_every_preference_setting_the_domain_defines() {
+        for value in ns_core::PreferenceSetting::all() {
+            assert_eq!(preference_setting(value.as_str()).unwrap(), value);
+        }
+        assert!(preference_setting("maybe").is_err());
     }
 
     #[test]

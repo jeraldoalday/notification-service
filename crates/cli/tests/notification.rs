@@ -32,6 +32,7 @@ fn args(tenant_id: Uuid, recipient_id: Uuid) -> SubmitArgs {
         body: Some("Hello there".into()),
         template_id: None,
         template_vars: HashMap::new(),
+        topic: None,
         idempotency_key: None,
         max_attempts: None,
         scheduled_for: None,
