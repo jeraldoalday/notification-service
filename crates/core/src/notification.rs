@@ -8,6 +8,7 @@ use crate::error::{CoreError, CoreResult};
 use crate::idempotency::IdempotencyKey;
 use crate::priority::Priority;
 use crate::status::DeliveryStatus;
+use crate::topic::Topic;
 
 /// Ceiling on a notification's `max_attempts`.
 ///
@@ -40,6 +41,21 @@ pub struct Notification {
     pub body: String,
     pub template_id: Option<String>,
     pub template_vars: HashMap<String, String>,
+    /// What this message is about, if the caller said.
+    ///
+    /// Optional, and deliberately so: a notification with no topic is one
+    /// nobody has been given the chance to opt out of, so it is delivered
+    /// regardless of what the recipient has asked for. That makes the
+    /// preference mechanism opt-in per message rather than per
+    /// deployment, and means a password reset added to a codebase years
+    /// before topics existed cannot be silenced by a marketing opt-out.
+    ///
+    /// `default` on the way in and skipped on the way out, for the same
+    /// reason `idempotency_key` is: notifications are stored as JSON
+    /// documents, so rows written before this field existed have to keep
+    /// deserializing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub topic: Option<Topic>,
     /// The caller's name for this submission, if it gave one.
     ///
     /// `default` on the way in and skipped on the way out, because a
@@ -102,6 +118,7 @@ impl Notification {
             && self.body == other.body
             && self.template_id == other.template_id
             && self.template_vars == other.template_vars
+            && self.topic == other.topic
             && self.max_attempts == other.max_attempts
             && self.scheduled_for == other.scheduled_for
     }
@@ -131,6 +148,7 @@ pub struct NotificationBuilder {
     body: Option<String>,
     template_id: Option<String>,
     template_vars: HashMap<String, String>,
+    topic: Option<Topic>,
     idempotency_key: Option<IdempotencyKey>,
     max_attempts: u32,
     scheduled_for: Option<DateTime<Utc>>,
@@ -147,6 +165,7 @@ impl NotificationBuilder {
             body: None,
             template_id: None,
             template_vars: HashMap::new(),
+            topic: None,
             idempotency_key: None,
             max_attempts: 5,
             scheduled_for: None,
@@ -175,6 +194,14 @@ impl NotificationBuilder {
 
     pub fn template_var(mut self, key: impl Into<String>, value: impl Into<String>) -> Self {
         self.template_vars.insert(key.into(), value.into());
+        self
+    }
+
+    /// Says what this message is about, so the recipient's preferences
+    /// for that topic apply to it. A notification with no topic is
+    /// delivered whatever the recipient has opted out of.
+    pub fn topic(mut self, topic: Topic) -> Self {
+        self.topic = Some(topic);
         self
     }
 
@@ -228,6 +255,7 @@ impl NotificationBuilder {
             body: self.body.unwrap_or_default(),
             template_id: self.template_id,
             template_vars: self.template_vars,
+            topic: self.topic,
             idempotency_key: self.idempotency_key,
             attempt_count: 0,
             max_attempts: self.max_attempts,
@@ -241,6 +269,7 @@ impl NotificationBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::topic::Topic;
     use chrono::Duration;
 
     fn build_ok() -> Notification {
@@ -471,6 +500,55 @@ mod tests {
         first.id = Uuid::new_v4();
 
         assert!(first.has_same_content_as(&second));
+    }
+
+    #[test]
+    fn a_notification_carries_no_topic_unless_asked() {
+        let n = build_ok();
+        assert_eq!(n.topic, None);
+
+        // An absent topic adds no field, so a row written today is
+        // readable by a build that predates topics entirely.
+        let json = serde_json::to_value(&n).unwrap();
+        assert!(json.get("topic").is_none());
+    }
+
+    #[test]
+    fn the_builder_carries_a_topic_through() {
+        let topic = Topic::new("order-updates").unwrap();
+        let n = Notification::builder(Uuid::new_v4(), Uuid::new_v4(), ChannelKind::Email)
+            .body("your order shipped")
+            .topic(topic.clone())
+            .build()
+            .unwrap();
+        assert_eq!(n.topic, Some(topic));
+    }
+
+    #[test]
+    fn a_notification_stored_before_topics_existed_still_deserializes() {
+        let mut json = serde_json::to_value(build_ok()).unwrap();
+        json.as_object_mut().unwrap().remove("topic");
+        assert_eq!(serde_json::from_value::<Notification>(json).unwrap().topic, None);
+    }
+
+    #[test]
+    fn two_topics_are_two_different_messages() {
+        // A retry that changed the topic changed what the recipient's
+        // preferences will be applied to, which is a different request
+        // however identical the words are.
+        let tenant = Uuid::new_v4();
+        let recipient = Uuid::new_v4();
+        let with = |topic: Option<&str>| {
+            let mut builder = Notification::builder(tenant, recipient, ChannelKind::Email).body("hi");
+            if let Some(topic) = topic {
+                builder = builder.topic(Topic::new(topic).unwrap());
+            }
+            builder.build().unwrap()
+        };
+
+        assert!(with(Some("orders")).has_same_content_as(&with(Some("orders"))));
+        assert!(!with(Some("orders")).has_same_content_as(&with(Some("marketing"))));
+        assert!(!with(Some("orders")).has_same_content_as(&with(None)));
     }
 
     #[test]

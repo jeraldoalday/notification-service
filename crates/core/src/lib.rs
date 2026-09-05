@@ -7,6 +7,7 @@ pub mod priority;
 pub mod recipient;
 pub mod status;
 pub mod suppression;
+pub mod topic;
 
 pub use attempt::{AttemptResult, DeliveryAttempt};
 pub use channel::{Channel, ChannelKind};
@@ -17,3 +18,4 @@ pub use priority::Priority;
 pub use recipient::{Recipient, RecipientAddress};
 pub use status::DeliveryStatus;
 pub use suppression::{Suppression, SuppressionReason};
+pub use topic::{Topic, MAX_TOPIC_LEN};
