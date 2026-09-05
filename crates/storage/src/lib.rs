@@ -4,7 +4,7 @@ pub mod sqlite;
 
 pub use error::{StorageError, StorageResult};
 pub use repository::{
-    ApiKeyRepository, DeliveryAttemptRepository, NotificationRepository, RecipientRepository,
-    SuppressionRepository, TemplateRepository,
+    ApiKeyRepository, DeliveryAttemptRepository, NotificationRepository, PreferenceRepository,
+    RecipientRepository, SuppressionRepository, TemplateRepository,
 };
 pub use sqlite::SqliteStorage;

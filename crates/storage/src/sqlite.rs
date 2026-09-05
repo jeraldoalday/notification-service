@@ -5,7 +5,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, SecondsFormat, Utc};
 use ns_auth::ApiKey;
 use ns_core::{
-    DeliveryAttempt, DeliveryStatus, IdempotencyKey, Notification, Recipient, RecipientAddress, Suppression,
+    ChannelKind, DeliveryAttempt, DeliveryStatus, IdempotencyKey, Notification, Preference, PreferenceSet,
+    Recipient, RecipientAddress, Suppression, Topic,
 };
 use ns_templates::Template;
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
@@ -14,8 +15,8 @@ use uuid::Uuid;
 
 use crate::error::{StorageError, StorageResult};
 use crate::repository::{
-    ApiKeyRepository, DeliveryAttemptRepository, NotificationRepository, RecipientRepository,
-    SuppressionRepository, TemplateRepository,
+    ApiKeyRepository, DeliveryAttemptRepository, NotificationRepository, PreferenceRepository,
+    RecipientRepository, SuppressionRepository, TemplateRepository,
 };
 
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!();
@@ -570,6 +571,20 @@ impl DeliveryAttemptRepository for SqliteStorage {
     }
 }
 
+/// Reads a `data` column back into whatever entity it holds.
+///
+/// Every table here stores its entity as a JSON document in `data`, so
+/// every listing ends with the same three lines. Written once and generic
+/// over the entity rather than copied per repository.
+fn decode_all<T: serde::de::DeserializeOwned>(rows: Vec<sqlx::sqlite::SqliteRow>) -> StorageResult<Vec<T>> {
+    rows.into_iter()
+        .map(|row| {
+            let data: String = row.try_get("data")?;
+            Ok(serde_json::from_str(&data)?)
+        })
+        .collect()
+}
+
 /// Shared by the two attempt listings, which differ only in their ORDER BY.
 fn decode_attempts(rows: Vec<sqlx::sqlite::SqliteRow>) -> StorageResult<Vec<DeliveryAttempt>> {
     rows.into_iter()
@@ -666,12 +681,109 @@ impl SuppressionRepository for SqliteStorage {
     }
 }
 
+#[async_trait]
+impl PreferenceRepository for SqliteStorage {
+    async fn set_preference(&self, preference: &Preference) -> StorageResult<()> {
+        let data = serde_json::to_string(preference)?;
+        // Upsert, because a recipient changing their mind is the ordinary
+        // case rather than a conflict. `updated_at` moves with the row,
+        // since it now describes the later decision -- which is also what
+        // keeps the listing's ordering meaningful.
+        sqlx::query(
+            "INSERT INTO preferences (tenant_id, recipient_id, topic, channel, setting, updated_at, data)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT (tenant_id, recipient_id, topic, channel)
+             DO UPDATE SET setting = excluded.setting,
+                           updated_at = excluded.updated_at,
+                           data = excluded.data",
+        )
+        .bind(preference.tenant_id.to_string())
+        .bind(preference.recipient_id.to_string())
+        .bind(preference.topic.as_str())
+        .bind(preference.channel_key())
+        .bind(preference.setting.as_str())
+        .bind(to_ts(preference.updated_at))
+        .bind(data)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn preferences_for(
+        &self,
+        tenant_id: Uuid,
+        recipient_id: Uuid,
+        topic: &Topic,
+    ) -> StorageResult<PreferenceSet> {
+        // (tenant_id, recipient_id, topic) is a prefix of the primary
+        // key, so this is a range read over at most one row per channel
+        // plus the wildcard -- five rows today, and bounded by the number
+        // of channels forever. It runs before every topical send, which is
+        // why it is one query rather than a channel lookup followed by a
+        // wildcard fallback.
+        let rows = sqlx::query(
+            "SELECT data FROM preferences
+             WHERE tenant_id = ? AND recipient_id = ? AND topic = ?",
+        )
+        .bind(tenant_id.to_string())
+        .bind(recipient_id.to_string())
+        .bind(topic.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(PreferenceSet::new(decode_all(rows)?))
+    }
+
+    async fn list_preferences(
+        &self,
+        tenant_id: Uuid,
+        recipient_id: Uuid,
+        limit: u32,
+    ) -> StorageResult<Vec<Preference>> {
+        let rows = sqlx::query(
+            "SELECT data FROM preferences
+             WHERE tenant_id = ? AND recipient_id = ?
+             ORDER BY updated_at DESC, topic ASC, channel ASC
+             LIMIT ?",
+        )
+        .bind(tenant_id.to_string())
+        .bind(recipient_id.to_string())
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+
+        decode_all(rows)
+    }
+
+    async fn delete_preference(
+        &self,
+        tenant_id: Uuid,
+        recipient_id: Uuid,
+        topic: &Topic,
+        channel: Option<ChannelKind>,
+    ) -> StorageResult<bool> {
+        let result = sqlx::query(
+            "DELETE FROM preferences
+             WHERE tenant_id = ? AND recipient_id = ? AND topic = ? AND channel = ?",
+        )
+        .bind(tenant_id.to_string())
+        .bind(recipient_id.to_string())
+        .bind(topic.as_str())
+        .bind(ns_core::preference::channel_key(channel))
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use chrono::Duration;
     use ns_auth::ApiKey;
-    use ns_core::{ChannelKind, DeliveryStatus, IdempotencyKey, Priority, Recipient, RecipientAddress};
+    use ns_core::{
+        ChannelKind, DeliveryStatus, IdempotencyKey, PreferenceSetting, Priority, Recipient, RecipientAddress,
+    };
 
     /// Each test gets its own on-disk SQLite file rather than
     /// `sqlite::memory:`, since a pooled connection to `:memory:` gives
@@ -1734,5 +1846,222 @@ mod tests {
         storage.insert_api_key(&first).await.unwrap();
         let err = storage.insert_api_key(&clash).await.unwrap_err();
         assert!(matches!(err, StorageError::Database(_)), "{err:?}");
+    }
+
+    fn topic(raw: &str) -> Topic {
+        Topic::new(raw).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_recipient_with_no_preferences_has_an_empty_set() {
+        let (storage, _dir) = test_storage().await;
+
+        let set = storage.preferences_for(Uuid::new_v4(), Uuid::new_v4(), &topic("marketing")).await.unwrap();
+        assert!(set.is_empty());
+        assert!(set.allows(ChannelKind::Email), "silence means send it");
+    }
+
+    #[tokio::test]
+    async fn a_stored_preference_comes_back_in_the_set_for_its_topic() {
+        let (storage, _dir) = test_storage().await;
+        let (tenant, recipient) = (Uuid::new_v4(), Uuid::new_v4());
+        let preference = Preference::block(tenant, recipient, topic("marketing"), Utc::now());
+        storage.set_preference(&preference).await.unwrap();
+
+        let set = storage.preferences_for(tenant, recipient, &topic("marketing")).await.unwrap();
+        assert_eq!(set.entries(), &[preference]);
+        assert!(!set.allows(ChannelKind::Email));
+    }
+
+    #[tokio::test]
+    async fn preferences_are_scoped_to_one_topic() {
+        let (storage, _dir) = test_storage().await;
+        let (tenant, recipient) = (Uuid::new_v4(), Uuid::new_v4());
+        storage
+            .set_preference(&Preference::block(tenant, recipient, topic("marketing"), Utc::now()))
+            .await
+            .unwrap();
+
+        // Opting out of one thing is not opting out of everything -- the
+        // entire reason topics exist.
+        let receipts = storage.preferences_for(tenant, recipient, &topic("receipts")).await.unwrap();
+        assert!(receipts.is_empty());
+        assert!(receipts.allows(ChannelKind::Email));
+    }
+
+    #[tokio::test]
+    async fn preferences_are_scoped_to_one_recipient_and_one_tenant() {
+        let (storage, _dir) = test_storage().await;
+        let (tenant, recipient) = (Uuid::new_v4(), Uuid::new_v4());
+        storage
+            .set_preference(&Preference::block(tenant, recipient, topic("marketing"), Utc::now()))
+            .await
+            .unwrap();
+
+        assert!(storage
+            .preferences_for(tenant, Uuid::new_v4(), &topic("marketing"))
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(storage
+            .preferences_for(Uuid::new_v4(), recipient, &topic("marketing"))
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_wildcard_and_a_channel_preference_are_separate_rows() {
+        let (storage, _dir) = test_storage().await;
+        let (tenant, recipient) = (Uuid::new_v4(), Uuid::new_v4());
+        storage
+            .set_preference(&Preference::block(tenant, recipient, topic("orders"), Utc::now()))
+            .await
+            .unwrap();
+        storage
+            .set_preference(&Preference::allow_on(
+                tenant,
+                recipient,
+                topic("orders"),
+                ChannelKind::Sms,
+                Utc::now(),
+            ))
+            .await
+            .unwrap();
+
+        // The `*` spelling has to keep the wildcard distinct from a real
+        // channel; a NULL here would collide with itself and lose one of
+        // these two rows.
+        let set = storage.preferences_for(tenant, recipient, &topic("orders")).await.unwrap();
+        assert_eq!(set.len(), 2);
+        assert!(set.allows(ChannelKind::Sms));
+        assert!(!set.allows(ChannelKind::Email));
+    }
+
+    #[tokio::test]
+    async fn setting_the_same_preference_again_replaces_it() {
+        let (storage, _dir) = test_storage().await;
+        let (tenant, recipient) = (Uuid::new_v4(), Uuid::new_v4());
+        storage
+            .set_preference(&Preference::block(tenant, recipient, topic("orders"), Utc::now()))
+            .await
+            .unwrap();
+
+        let changed_mind = Preference::new(
+            tenant,
+            recipient,
+            topic("orders"),
+            None,
+            PreferenceSetting::Allowed,
+            Utc::now() + Duration::seconds(30),
+        );
+        storage.set_preference(&changed_mind).await.unwrap();
+
+        let set = storage.preferences_for(tenant, recipient, &topic("orders")).await.unwrap();
+        assert_eq!(set.entries(), &[changed_mind], "one row, holding the later answer");
+    }
+
+    #[tokio::test]
+    async fn listing_a_recipients_preferences_returns_the_most_recent_first() {
+        let (storage, _dir) = test_storage().await;
+        let (tenant, recipient) = (Uuid::new_v4(), Uuid::new_v4());
+        let now = Utc::now();
+        for (index, name) in ["marketing", "orders", "digest"].iter().enumerate() {
+            storage
+                .set_preference(&Preference::block(
+                    tenant,
+                    recipient,
+                    topic(name),
+                    now + Duration::seconds(index as i64),
+                ))
+                .await
+                .unwrap();
+        }
+
+        let listed = storage.list_preferences(tenant, recipient, 10).await.unwrap();
+        let topics: Vec<&str> = listed.iter().map(|p| p.topic.as_str()).collect();
+        assert_eq!(topics, ["digest", "orders", "marketing"]);
+    }
+
+    #[tokio::test]
+    async fn listing_preferences_respects_its_limit() {
+        let (storage, _dir) = test_storage().await;
+        let (tenant, recipient) = (Uuid::new_v4(), Uuid::new_v4());
+        for name in ["a-topic", "b-topic", "c-topic"] {
+            storage
+                .set_preference(&Preference::block(tenant, recipient, topic(name), Utc::now()))
+                .await
+                .unwrap();
+        }
+
+        assert_eq!(storage.list_preferences(tenant, recipient, 2).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn deleting_a_preference_reports_whether_there_was_one() {
+        let (storage, _dir) = test_storage().await;
+        let (tenant, recipient) = (Uuid::new_v4(), Uuid::new_v4());
+        storage
+            .set_preference(&Preference::block(tenant, recipient, topic("orders"), Utc::now()))
+            .await
+            .unwrap();
+
+        assert!(storage.delete_preference(tenant, recipient, &topic("orders"), None).await.unwrap());
+        assert!(!storage.delete_preference(tenant, recipient, &topic("orders"), None).await.unwrap());
+        assert!(storage.preferences_for(tenant, recipient, &topic("orders")).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn deleting_the_wildcard_leaves_a_channel_preference_alone() {
+        let (storage, _dir) = test_storage().await;
+        let (tenant, recipient) = (Uuid::new_v4(), Uuid::new_v4());
+        storage
+            .set_preference(&Preference::block(tenant, recipient, topic("orders"), Utc::now()))
+            .await
+            .unwrap();
+        let pinned = Preference::allow_on(tenant, recipient, topic("orders"), ChannelKind::Sms, Utc::now());
+        storage.set_preference(&pinned).await.unwrap();
+
+        assert!(storage.delete_preference(tenant, recipient, &topic("orders"), None).await.unwrap());
+
+        let set = storage.preferences_for(tenant, recipient, &topic("orders")).await.unwrap();
+        assert_eq!(set.entries(), &[pinned]);
+    }
+
+    #[tokio::test]
+    async fn the_delivery_path_lookup_is_a_point_query_on_the_primary_key() {
+        // This runs before every topical send, so a scan here is a scan
+        // per notification. EXPLAIN is the only thing that can tell a
+        // correct answer from a cheap one.
+        let (storage, _dir) = test_storage().await;
+        let rows = sqlx::query(
+            "EXPLAIN QUERY PLAN SELECT data FROM preferences
+             WHERE tenant_id = 'x' AND recipient_id = 'y' AND topic = 'orders'",
+        )
+        .fetch_all(&storage.pool)
+        .await
+        .unwrap();
+        let plan: Vec<String> = rows.iter().map(|row| row.try_get::<String, _>("detail").unwrap()).collect();
+        let plan = plan.join("\n");
+
+        assert!(plan.contains("USING PRIMARY KEY") || plan.contains("USING INDEX"), "scanning:\n{plan}");
+        assert!(!plan.contains("SCAN preferences"), "scanning:\n{plan}");
+    }
+
+    #[tokio::test]
+    async fn listing_a_recipients_preferences_reads_the_order_off_an_index() {
+        let (storage, _dir) = test_storage().await;
+        let rows = sqlx::query(
+            "EXPLAIN QUERY PLAN SELECT data FROM preferences
+             WHERE tenant_id = 'x' AND recipient_id = 'y'
+             ORDER BY updated_at DESC, topic ASC, channel ASC LIMIT 50",
+        )
+        .fetch_all(&storage.pool)
+        .await
+        .unwrap();
+        let plan: Vec<String> = rows.iter().map(|row| row.try_get::<String, _>("detail").unwrap()).collect();
+        let plan = plan.join("\n");
+
+        assert!(plan.contains("idx_preferences_recipient"), "not using the index:\n{plan}");
     }
 }

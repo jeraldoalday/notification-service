@@ -4,7 +4,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use ns_auth::ApiKey;
 use ns_core::{
-    DeliveryAttempt, DeliveryStatus, IdempotencyKey, Notification, Recipient, RecipientAddress, Suppression,
+    DeliveryAttempt, DeliveryStatus, IdempotencyKey, Notification, Preference, PreferenceSet, Recipient,
+    RecipientAddress, Suppression, Topic,
 };
 use ns_templates::Template;
 use uuid::Uuid;
@@ -231,4 +232,65 @@ pub trait SuppressionRepository: Send + Sync {
     /// idempotent operation an operator may well run without knowing the
     /// current state, and the caller that does care can still tell.
     async fn delete_suppression(&self, tenant_id: Uuid, address: &RecipientAddress) -> StorageResult<bool>;
+}
+
+/// Persistence for `Preference`s: what each recipient has asked to be
+/// sent, per topic.
+///
+/// The delivery-path method is `preferences_for`, and it returns a whole
+/// `PreferenceSet` rather than a single row on purpose. Deciding a send
+/// needs every preference the recipient holds for that topic -- a
+/// wildcard block and a channel exception only mean something read as a
+/// pair -- and there are at most `ChannelKind::all().len() + 1` of them,
+/// so fetching the set costs one indexed range read rather than the two
+/// point queries a "look for the channel row, then fall back to the
+/// wildcard" API would need.
+#[async_trait]
+pub trait PreferenceRepository: Send + Sync {
+    /// Records a recipient's answer, replacing any previous one for the
+    /// same (recipient, topic, channel).
+    ///
+    /// Replacing rather than failing, for the same reason
+    /// `insert_suppression` does: a recipient changing their mind is the
+    /// ordinary case, not an error, and the caller's intent is satisfied
+    /// either way. The write is named `set_preference` rather than
+    /// `insert_preference` so that is visible at the call site.
+    async fn set_preference(&self, preference: &Preference) -> StorageResult<()>;
+
+    /// Every preference `recipient_id` holds for `topic`, as the set the
+    /// delivery path resolves.
+    ///
+    /// An empty set is the answer for a recipient who has said nothing,
+    /// not an error: silence is the common case and it means "send it".
+    async fn preferences_for(
+        &self,
+        tenant_id: Uuid,
+        recipient_id: Uuid,
+        topic: &Topic,
+    ) -> StorageResult<PreferenceSet>;
+
+    /// Everything one recipient has said, across every topic, most
+    /// recently changed first, capped at `limit`. This is what a
+    /// preference centre renders.
+    async fn list_preferences(
+        &self,
+        tenant_id: Uuid,
+        recipient_id: Uuid,
+        limit: u32,
+    ) -> StorageResult<Vec<Preference>>;
+
+    /// Forgets one answer, returning whether there was one to forget.
+    ///
+    /// Deleting is not the same as setting `Allowed`, and both are worth
+    /// having. Setting `Allowed` records that the recipient said yes,
+    /// which is what carves an exception out of a broader block; deleting
+    /// returns them to having said nothing at all, which is what an
+    /// operator undoing a mistaken import wants.
+    async fn delete_preference(
+        &self,
+        tenant_id: Uuid,
+        recipient_id: Uuid,
+        topic: &Topic,
+        channel: Option<ns_core::ChannelKind>,
+    ) -> StorageResult<bool>;
 }
