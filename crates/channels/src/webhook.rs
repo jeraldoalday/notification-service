@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use async_trait::async_trait;
 use ns_core::{Notification, RecipientAddress};
 use serde::Serialize;
@@ -5,6 +7,15 @@ use uuid::Uuid;
 
 use crate::channel::NotificationChannel;
 use crate::error::{ChannelError, ChannelResult};
+
+/// Request timeout `WebhookChannel::default` gives its client.
+///
+/// The URL a webhook POSTs to is tenant-supplied, so it can point at a
+/// host that never responds at all. Without a bound, that single stuck
+/// request would hold a worker slot indefinitely -- never succeeding,
+/// never failing, and so never tripping the circuit breaker either, since
+/// there is no attempt for it to count as a failure.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Delivers by POSTing a JSON payload describing the notification to the
 /// recipient's webhook URL. Any non-2xx response is treated as a
@@ -21,7 +32,11 @@ impl WebhookChannel {
 
 impl Default for WebhookChannel {
     fn default() -> Self {
-        Self::new(reqwest::Client::new())
+        let client = reqwest::Client::builder()
+            .timeout(DEFAULT_TIMEOUT)
+            .build()
+            .expect("the default client configuration is always valid");
+        Self::new(client)
     }
 }
 
@@ -107,6 +122,27 @@ mod tests {
 
         let err = channel.send(&sample_notification(), &address).await.unwrap_err();
         assert!(matches!(err, ChannelError::Rejected(_)));
+    }
+
+    #[tokio::test]
+    async fn a_hung_endpoint_times_out_instead_of_blocking_forever() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/hook"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60)))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::builder().timeout(Duration::from_millis(50)).build().unwrap();
+        let channel = WebhookChannel::new(client);
+        let address = RecipientAddress::WebhookUrl(format!("{}/hook", server.uri()));
+
+        let err =
+            tokio::time::timeout(Duration::from_secs(5), channel.send(&sample_notification(), &address))
+                .await
+                .expect("the client's own timeout should fire well before this outer guard")
+                .unwrap_err();
+        assert!(matches!(err, ChannelError::Transport(_)));
     }
 
     #[tokio::test]
