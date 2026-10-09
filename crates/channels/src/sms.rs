@@ -1,9 +1,18 @@
+use std::time::Duration;
+
 use async_trait::async_trait;
 use ns_core::{Notification, RecipientAddress};
 use serde::Serialize;
 
 use crate::channel::NotificationChannel;
 use crate::error::{ChannelError, ChannelResult};
+
+/// Request timeout `SmsChannel::with_default_client` gives its client, for
+/// the same reason `WebhookChannel::default` does: the provider is a
+/// third-party host reached over the network, and a request with no bound
+/// can hang a worker slot forever instead of ever failing and tripping the
+/// circuit breaker.
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Sends SMS through a Twilio-style REST provider: `POST {base_url}/messages`
 /// with a bearer token and a `{to, from, body}` JSON payload.
@@ -22,6 +31,21 @@ impl SmsChannel {
         from_number: impl Into<String>,
     ) -> Self {
         Self { client, base_url: base_url.into(), api_key: api_key.into(), from_number: from_number.into() }
+    }
+
+    /// Builds the client with a bounded request timeout instead of
+    /// requiring every caller to remember one. Prefer this over
+    /// `new(reqwest::Client::new(), ..)`, which has no timeout at all.
+    pub fn with_default_client(
+        base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        from_number: impl Into<String>,
+    ) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(DEFAULT_TIMEOUT)
+            .build()
+            .expect("the default client configuration is always valid");
+        Self::new(client, base_url, api_key, from_number)
     }
 }
 
@@ -116,5 +140,26 @@ mod tests {
 
         let err = channel.send(&sample_notification(), &address).await.unwrap_err();
         assert!(matches!(err, ChannelError::AddressMismatch));
+    }
+
+    #[tokio::test]
+    async fn a_hung_provider_times_out_instead_of_blocking_forever() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/messages"))
+            .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(60)))
+            .mount(&server)
+            .await;
+
+        let client = reqwest::Client::builder().timeout(Duration::from_millis(50)).build().unwrap();
+        let channel = SmsChannel::new(client, server.uri(), "test-api-key", "+15555550100");
+        let address = RecipientAddress::Phone("+15555550199".into());
+
+        let err =
+            tokio::time::timeout(Duration::from_secs(5), channel.send(&sample_notification(), &address))
+                .await
+                .expect("the client's own timeout should fire well before this outer guard")
+                .unwrap_err();
+        assert!(matches!(err, ChannelError::Transport(_)));
     }
 }
