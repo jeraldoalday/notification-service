@@ -60,7 +60,7 @@ pub fn preference_setting(raw: &str) -> Result<ns_core::PreferenceSetting, Strin
 }
 
 pub fn priority(raw: &str) -> Result<Priority, String> {
-    parse_enum(raw, &["low", "normal", "high", "critical"])
+    parse_enum(raw, &Priority::all().map(|p| p.as_str()))
 }
 
 /// Parses a `--var name=value` pair. Only the first `=` separates, so a
@@ -136,9 +136,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_priorities() {
-        assert_eq!(priority("critical").unwrap(), Priority::Critical);
-        assert_eq!(priority("normal").unwrap(), Priority::Normal);
+    fn parses_every_priority_the_domain_defines() {
+        for value in Priority::all() {
+            assert_eq!(priority(value.as_str()).unwrap(), value);
+        }
+        assert!(priority("urgent").unwrap_err().contains("critical"));
     }
 
     #[test]
