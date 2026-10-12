@@ -74,6 +74,12 @@ pub struct SmtpSettings {
     pub host: String,
     pub port: u16,
     pub username: String,
+    /// Defaults empty; a real value belongs in `NS_SMTP_PASSWORD`, not in
+    /// the checked-in config file, alongside the credential it pairs
+    /// with. Still a field on `Settings` (rather than read straight from
+    /// the environment by the caller) so `smtp_transport`'s credentials
+    /// both come from the same place.
+    pub password: String,
     pub from_address: String,
 }
 
@@ -83,6 +89,7 @@ impl Default for SmtpSettings {
             host: "localhost".to_string(),
             port: 587,
             username: String::new(),
+            password: String::new(),
             from_address: "notifications@example.com".to_string(),
         }
     }

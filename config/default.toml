@@ -20,6 +20,9 @@ max_retry_attempts = 5
 host = "localhost"
 port = 587
 username = ""
+# Leave unset here; set NS_SMTP_PASSWORD at runtime instead of committing
+# a credential to this file.
+password = ""
 from_address = "notifications@example.com"
 
 [auth]

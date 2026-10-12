@@ -24,8 +24,8 @@ pub fn load_from_file(path: impl AsRef<Path>) -> Result<Settings, ConfigError> {
 /// Recognized keys: `NS_SERVER_HOST`, `NS_SERVER_PORT`, `NS_DATABASE_URL`,
 /// `NS_DATABASE_MAX_CONNECTIONS`, `NS_QUEUE_POLL_INTERVAL_MS`,
 /// `NS_QUEUE_BATCH_SIZE`, `NS_QUEUE_MAX_RETRY_ATTEMPTS`, `NS_SMTP_HOST`,
-/// `NS_SMTP_PORT`, `NS_SMTP_USERNAME`, `NS_SMTP_FROM_ADDRESS`,
-/// `NS_AUTH_ENABLED`.
+/// `NS_SMTP_PORT`, `NS_SMTP_USERNAME`, `NS_SMTP_PASSWORD`,
+/// `NS_SMTP_FROM_ADDRESS`, `NS_AUTH_ENABLED`.
 /// Unrecognized keys are ignored so callers can pass through the full
 /// process environment safely.
 pub fn apply_overrides(
@@ -62,6 +62,9 @@ pub fn apply_overrides(
     parse_override!("NS_SMTP_PORT", settings.smtp.port);
     if let Some(user) = overrides.get("NS_SMTP_USERNAME") {
         settings.smtp.username = user.clone();
+    }
+    if let Some(password) = overrides.get("NS_SMTP_PASSWORD") {
+        settings.smtp.password = password.clone();
     }
     if let Some(from) = overrides.get("NS_SMTP_FROM_ADDRESS") {
         settings.smtp.from_address = from.clone();
@@ -130,6 +133,20 @@ mod tests {
         let settings = apply_overrides(Settings::default(), &overrides).unwrap();
         assert_eq!(settings.queue.max_retry_attempts, 8);
         assert_eq!(settings.smtp.from_address, "alerts@example.com");
+    }
+
+    #[test]
+    fn smtp_password_defaults_empty_and_is_overridable() {
+        // `smtp_transport` needs a password to authenticate, but a real
+        // one has no business sitting in the checked-in
+        // `config/default.toml` -- it ships empty there and is meant to
+        // be supplied at runtime via NS_SMTP_PASSWORD instead.
+        assert_eq!(Settings::default().smtp.password, "");
+
+        let mut overrides = HashMap::new();
+        overrides.insert("NS_SMTP_PASSWORD".to_string(), "s3cret".to_string());
+        let settings = apply_overrides(Settings::default(), &overrides).unwrap();
+        assert_eq!(settings.smtp.password, "s3cret");
     }
 
     #[test]
