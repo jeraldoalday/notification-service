@@ -72,7 +72,17 @@ impl CircuitBreaker {
         let breaker = breakers.entry(kind).or_insert_with(Breaker::new);
 
         match breaker.state {
-            State::Closed | State::HalfOpen => true,
+            State::Closed => true,
+            // Exactly one trial send may be in flight at a time (see the
+            // `State::HalfOpen` doc comment above). The call that actually
+            // flips `Open` -> `HalfOpen` below is that one trial; every
+            // other call that observes the breaker already `HalfOpen` --
+            // whether a concurrent dispatch against the same channel or a
+            // later poll before the trial's outcome was recorded -- must be
+            // denied, or an outage's whole backlog gets to retry the
+            // instant the cooldown elapses instead of the single probe the
+            // state exists to allow.
+            State::HalfOpen => false,
             State::Open => {
                 let opened_at = breaker.opened_at.expect("Open state always records opened_at");
                 if now - opened_at >= self.reset_after {
@@ -210,6 +220,30 @@ mod tests {
         // trial_at + 10s even though it would have been relative to `now`.
         assert!(!breaker.allow(ChannelKind::Push, trial_at + Duration::seconds(10)));
         assert!(breaker.allow(ChannelKind::Push, trial_at + Duration::seconds(31)));
+    }
+
+    #[test]
+    fn only_one_trial_is_allowed_while_half_open() {
+        let breaker = CircuitBreaker::new(1, Duration::seconds(30));
+        let now = Utc::now();
+
+        breaker.record_failure(ChannelKind::Push, now);
+        let trial_at = now + Duration::seconds(31);
+        assert!(
+            breaker.allow(ChannelKind::Push, trial_at),
+            "cooldown elapsed, should allow the one trial send"
+        );
+
+        // A second dispatch checking the same channel before the first
+        // trial's outcome is recorded -- a concurrent worker, or this same
+        // worker polling again -- must not get a trial of its own: that
+        // would be two sends in flight against a provider the breaker
+        // doesn't yet know is healthy again.
+        assert!(!breaker.allow(ChannelKind::Push, trial_at), "a trial is already in flight");
+        assert!(
+            !breaker.allow(ChannelKind::Push, trial_at + Duration::seconds(1)),
+            "still only one trial outstanding"
+        );
     }
 
     #[test]
