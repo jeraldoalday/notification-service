@@ -8,6 +8,8 @@ This is a real, actively-developed project, built incrementally rather than
 scaffolded in one shot. See [ARCHITECTURE.md](./ARCHITECTURE.md) for the
 overall design and current build status.
 
+> **How this project is built:** I develop this service with AI coding agents. I decide what the delivery and retry rules should be, review each change and its tests, and merge what holds up.
+
 ## Status
 
 Early and under active development. The domain model, configuration layer,
