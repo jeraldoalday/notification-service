@@ -96,8 +96,8 @@ async fn run() -> CliResult<()> {
         Command::Queue(QueueCommand::Replay { tenant, limit }) => {
             commands::queue::replay(&storage, tenant, limit, cli.output).await?
         }
-        Command::Queue(QueueCommand::PurgeAttempts { older_than_days }) => {
-            commands::queue::purge_attempts(&storage, older_than_days, cli.output).await?
+        Command::Queue(QueueCommand::PurgeAttempts { older_than_days, dry_run }) => {
+            commands::queue::purge_attempts(&storage, older_than_days, dry_run, cli.output).await?
         }
         Command::Suppression(SuppressionCommand::Add { tenant, channel, address, reason, note }) => {
             commands::suppression::add(&storage, tenant, channel, address, reason, note, cli.output).await?

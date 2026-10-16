@@ -139,12 +139,33 @@ async fn purge_attempts_drops_only_what_is_older_than_the_cutoff() {
         .await;
     record(&storage, &notification, AttemptResult::Delivered, None, Utc::now()).await;
 
-    let rendered = commands::queue::purge_attempts(&storage, 30, OutputFormat::Text).await.unwrap();
+    let rendered = commands::queue::purge_attempts(&storage, 30, false, OutputFormat::Text).await.unwrap();
 
     assert!(rendered.starts_with("purged 1 delivery attempt(s)"), "got {rendered}");
     let remaining = storage.list_attempts(notification.id, 10).await.unwrap();
     assert_eq!(remaining.len(), 1);
     assert_eq!(remaining[0].result, AttemptResult::Delivered);
+}
+
+#[tokio::test]
+async fn purge_attempts_dry_run_reports_without_deleting() {
+    let (storage, _dir) = test_storage().await;
+    let notification = seed_notification(&storage).await;
+    record(&storage, &notification, AttemptResult::Failed, Some("old"), Utc::now() - Duration::days(45))
+        .await;
+    record(&storage, &notification, AttemptResult::Delivered, None, Utc::now()).await;
+
+    let rendered = commands::queue::purge_attempts(&storage, 30, true, OutputFormat::Text).await.unwrap();
+
+    assert!(rendered.starts_with("would purge 1 delivery attempt(s)"), "got {rendered}");
+    let remaining = storage.list_attempts(notification.id, 10).await.unwrap();
+    assert_eq!(remaining.len(), 2, "a dry run must not delete anything");
+
+    // And it's safe to run as many times as it takes to pick the right
+    // cutoff -- running it again reports the same count.
+    let rendered_again =
+        commands::queue::purge_attempts(&storage, 30, true, OutputFormat::Text).await.unwrap();
+    assert!(rendered_again.starts_with("would purge 1 delivery attempt(s)"), "got {rendered_again}");
 }
 
 #[tokio::test]
@@ -154,7 +175,7 @@ async fn purge_attempts_leaves_the_notifications_themselves_alone() {
     record(&storage, &notification, AttemptResult::Failed, Some("old"), Utc::now() - Duration::days(45))
         .await;
 
-    commands::queue::purge_attempts(&storage, 1, OutputFormat::Text).await.unwrap();
+    commands::queue::purge_attempts(&storage, 1, false, OutputFormat::Text).await.unwrap();
 
     assert!(storage.get_notification(notification.id).await.is_ok());
 }
@@ -163,7 +184,7 @@ async fn purge_attempts_leaves_the_notifications_themselves_alone() {
 async fn purge_attempts_refuses_a_cutoff_of_now() {
     let (storage, _dir) = test_storage().await;
 
-    let err = commands::queue::purge_attempts(&storage, 0, OutputFormat::Text).await.unwrap_err();
+    let err = commands::queue::purge_attempts(&storage, 0, false, OutputFormat::Text).await.unwrap_err();
 
     assert!(err.to_string().contains("at least 1"), "got {err}");
 }
@@ -172,7 +193,7 @@ async fn purge_attempts_refuses_a_cutoff_of_now() {
 async fn purge_attempts_reports_the_cutoff_it_used() {
     let (storage, _dir) = test_storage().await;
 
-    let rendered = commands::queue::purge_attempts(&storage, 7, OutputFormat::Json).await.unwrap();
+    let rendered = commands::queue::purge_attempts(&storage, 7, false, OutputFormat::Json).await.unwrap();
 
     let parsed: serde_json::Value = serde_json::from_str(&rendered).unwrap();
     assert_eq!(parsed["purged"], 0);

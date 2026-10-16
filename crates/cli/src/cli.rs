@@ -465,5 +465,9 @@ pub enum QueueCommand {
     PurgeAttempts {
         #[arg(long, default_value_t = 30)]
         older_than_days: i64,
+
+        /// Report how many attempts would be deleted without deleting any.
+        #[arg(long)]
+        dry_run: bool,
     },
 }

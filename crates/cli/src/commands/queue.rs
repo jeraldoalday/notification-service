@@ -87,9 +87,11 @@ pub async fn replay(
 pub struct PurgeReport {
     pub cutoff: chrono::DateTime<Utc>,
     pub purged: u64,
+    pub dry_run: bool,
 }
 
-/// Drops delivery attempts older than `older_than_days`.
+/// Drops delivery attempts older than `older_than_days`, or with `dry_run`,
+/// only counts them.
 ///
 /// The attempt log is the only table here where one notification writes
 /// many rows and nothing ever removes one, so it is the only table with a
@@ -98,9 +100,16 @@ pub struct PurgeReport {
 /// small, they are what callers hold ids for, and deciding when a delivery
 /// record stops mattering is a policy question this tool shouldn't answer
 /// on an operator's behalf.
+///
+/// `--older-than-days` is easy to get wrong in the direction that loses
+/// history for good -- there's no undo once the real purge has run, and no
+/// way to tell afterward which rows a completed one took. `dry_run` answers
+/// the same count a real purge would delete, against the same cutoff,
+/// without deleting anything, so the number can be checked first.
 pub async fn purge_attempts(
     storage: &SqliteStorage,
     older_than_days: i64,
+    dry_run: bool,
     output: OutputFormat,
 ) -> CliResult<String> {
     if older_than_days < 1 {
@@ -112,12 +121,17 @@ pub async fn purge_attempts(
     }
 
     let cutoff = Utc::now() - Duration::days(older_than_days);
-    let purged = storage.purge_attempts_before(cutoff).await?;
+    let purged = if dry_run {
+        storage.count_attempts_before(cutoff).await?
+    } else {
+        storage.purge_attempts_before(cutoff).await?
+    };
 
-    let report = PurgeReport { cutoff, purged };
+    let report = PurgeReport { cutoff, purged, dry_run };
     output.render(&report, || {
         format!(
-            "purged {} delivery attempt(s) recorded before {}\n",
+            "{} {} delivery attempt(s) recorded before {}\n",
+            if report.dry_run { "would purge" } else { "purged" },
             report.purged,
             report.cutoff.to_rfc3339()
         )

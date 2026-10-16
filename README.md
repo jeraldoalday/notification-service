@@ -256,6 +256,7 @@ nothing ever removes one, so it is the one table with a retention job:
 
 ```sh
 ns queue purge-attempts --older-than-days 30
+ns queue purge-attempts --older-than-days 30 --dry-run   # report the count without deleting
 ```
 
 ## Suppression list

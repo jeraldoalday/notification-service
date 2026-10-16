@@ -189,6 +189,13 @@ pub trait DeliveryAttemptRepository: Send + Sync {
     /// one where a single notification writes many rows, and nothing else
     /// ever removes one.
     async fn purge_attempts_before(&self, cutoff: DateTime<Utc>) -> StorageResult<u64>;
+
+    /// How many attempts `purge_attempts_before(cutoff)` would delete,
+    /// without deleting any of them. Lets a `--dry-run` report the same
+    /// number a real purge would, against a log an operator has one
+    /// chance to get the cutoff right on -- there is no way to tell which
+    /// rows a completed purge took.
+    async fn count_attempts_before(&self, cutoff: DateTime<Utc>) -> StorageResult<u64>;
 }
 
 /// Persistence for `Suppression`s: the addresses a tenant may no longer

@@ -549,6 +549,16 @@ impl DeliveryAttemptRepository for SqliteStorage {
             .await?;
         Ok(result.rows_affected())
     }
+
+    async fn count_attempts_before(&self, cutoff: DateTime<Utc>) -> StorageResult<u64> {
+        // Same comparison `purge_attempts_before` deletes by, so a dry run
+        // reports exactly the row count the real purge would remove.
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM delivery_attempts WHERE occurred_at < ?")
+            .bind(to_ts(cutoff))
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(total as u64)
+    }
 }
 
 /// Reads a `data` column back into whatever entity it holds.
@@ -1074,6 +1084,35 @@ mod tests {
         // And the reverse holds by construction: there is no foreign key,
         // so the log outlives its subject too.
         assert!(storage.get_notification(notification.id).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn counting_before_a_cutoff_matches_what_purging_it_would_delete() {
+        use ns_core::AttemptResult;
+        let (storage, _dir) = test_storage().await;
+        let notification = sample_notification();
+
+        let mut old = sample_attempt(&notification, AttemptResult::Failed);
+        old.occurred_at = Utc::now() - Duration::days(40);
+        storage.record_attempt(&old).await.unwrap();
+        storage.record_attempt(&sample_attempt(&notification, AttemptResult::Delivered)).await.unwrap();
+
+        let cutoff = Utc::now() - Duration::days(30);
+        assert_eq!(storage.count_attempts_before(cutoff).await.unwrap(), 1);
+
+        // And counting never removes anything -- a dry run has to be safe
+        // to run as many times as it takes to pick the right cutoff.
+        assert_eq!(storage.purge_attempts_before(cutoff).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn counting_a_range_with_nothing_in_it_is_zero() {
+        use ns_core::AttemptResult;
+        let (storage, _dir) = test_storage().await;
+        let notification = sample_notification();
+        storage.record_attempt(&sample_attempt(&notification, AttemptResult::Delivered)).await.unwrap();
+
+        assert_eq!(storage.count_attempts_before(Utc::now() - Duration::days(1)).await.unwrap(), 0);
     }
 
     #[tokio::test]
