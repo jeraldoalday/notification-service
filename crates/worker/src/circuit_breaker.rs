@@ -257,6 +257,36 @@ mod tests {
     }
 
     #[test]
+    fn a_failure_reported_while_already_open_restarts_the_cooldown() {
+        // Shouldn't normally happen -- a denied `allow` means no send was
+        // attempted -- but `record_failure` while `Open` is reachable from
+        // a caller that reports an outcome without checking `allow` first,
+        // and the defensive branch that handles it (see the doc comment
+        // above) was otherwise never exercised by a test.
+        let breaker = CircuitBreaker::new(1, Duration::seconds(30));
+        let now = Utc::now();
+
+        breaker.record_failure(ChannelKind::Webhook, now);
+        assert!(!breaker.allow(ChannelKind::Webhook, now), "breaker should be open");
+
+        let ten_seconds_later = now + Duration::seconds(10);
+        breaker.record_failure(ChannelKind::Webhook, ten_seconds_later);
+
+        // The original cooldown (now + 30s) has not elapsed yet, but
+        // neither has the restarted one (ten_seconds_later + 30s) -- if the
+        // second failure were ignored instead of refreshing `opened_at`,
+        // this would already allow a trial.
+        let original_cooldown_elapsed = now + Duration::seconds(31);
+        assert!(
+            !breaker.allow(ChannelKind::Webhook, original_cooldown_elapsed),
+            "cooldown should have restarted from the second failure, not the first"
+        );
+
+        let restarted_cooldown_elapsed = ten_seconds_later + Duration::seconds(31);
+        assert!(breaker.allow(ChannelKind::Webhook, restarted_cooldown_elapsed));
+    }
+
+    #[test]
     fn disabled_breaker_never_trips() {
         let breaker = CircuitBreaker::disabled();
         let now = Utc::now();
