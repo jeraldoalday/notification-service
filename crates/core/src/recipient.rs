@@ -100,12 +100,64 @@ impl RecipientAddress {
                 }
             }
             RecipientAddress::WebhookUrl(url) => {
-                if url.starts_with("https://") || url.starts_with("http://") {
-                    Ok(())
-                } else {
-                    Err(CoreError::Validation(format!("webhook url must be http(s): {url}")))
+                let parsed = url::Url::parse(url)
+                    .map_err(|_| CoreError::Validation(format!("invalid webhook url: {url}")))?;
+
+                if parsed.scheme() != "http" && parsed.scheme() != "https" {
+                    return Err(CoreError::Validation(format!("webhook url must be http(s): {url}")));
                 }
+
+                let host = parsed
+                    .host()
+                    .ok_or_else(|| CoreError::Validation(format!("webhook url must name a host: {url}")))?;
+
+                if is_disallowed_webhook_host(&host) {
+                    return Err(CoreError::Validation(format!(
+                        "webhook url may not target a local or private address: {url}"
+                    )));
+                }
+
+                Ok(())
             }
+        }
+    }
+}
+
+/// Rejects a webhook host that is loopback, unspecified, link-local
+/// (including the `169.254.169.254` cloud instance-metadata address), or
+/// in a private range -- a tenant-chosen webhook destination that lands
+/// inside this deployment's own network is a server-side-request-forgery
+/// primitive, not a legitimate delivery target, and the worker would
+/// otherwise happily POST notification content to it on every retry.
+///
+/// This only catches an IP address or `localhost` written directly in the
+/// URL. A hostname that *resolves* to one of these ranges only once DNS
+/// answers -- which can also answer differently each time a request is
+/// made -- is a known gap a string check at registration time cannot
+/// close; closing that fully needs the resolved address checked again at
+/// connect time, on every delivery attempt.
+fn is_disallowed_webhook_host(host: &url::Host<&str>) -> bool {
+    match host {
+        // `url::Host::host_str()`/`Display` would bracket an IPv6 literal
+        // for re-embedding in a URL (`[::1]`), which `IpAddr::from_str`
+        // then refuses to parse -- matching the already-typed `Ipv4Addr`/
+        // `Ipv6Addr` the `Host` enum carries sidesteps that entirely.
+        url::Host::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
+        url::Host::Ipv4(ip) => {
+            let [a, b, _, _] = ip.octets();
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || a == 10
+                || (a == 172 && (16..=31).contains(&b))
+                || (a == 192 && b == 168)
+                || (a == 169 && b == 254)
+        }
+        url::Host::Ipv6(ip) => {
+            let first = ip.segments()[0];
+            ip.is_loopback()
+                || ip.is_unspecified()
+                || (first & 0xfe00) == 0xfc00 // fc00::/7, unique local
+                || (first & 0xffc0) == 0xfe80 // fe80::/10, link-local
         }
     }
 }
@@ -251,6 +303,57 @@ mod tests {
     fn webhook_requires_scheme() {
         assert!(RecipientAddress::WebhookUrl("example.com/hook".into()).validate().is_err());
         assert!(RecipientAddress::WebhookUrl("https://example.com/hook".into()).validate().is_ok());
+    }
+
+    #[test]
+    fn webhook_rejects_an_unparseable_url() {
+        assert!(RecipientAddress::WebhookUrl("http://".into()).validate().is_err());
+        assert!(RecipientAddress::WebhookUrl("not a url at all".into()).validate().is_err());
+    }
+
+    #[test]
+    fn webhook_rejects_loopback_and_localhost() {
+        for url in [
+            "http://localhost/hook",
+            "http://LOCALHOST/hook",
+            "http://127.0.0.1/hook",
+            "http://127.0.0.42/hook",
+            "http://[::1]/hook",
+        ] {
+            assert!(RecipientAddress::WebhookUrl(url.into()).validate().is_err(), "accepted {url}");
+        }
+    }
+
+    #[test]
+    fn webhook_rejects_private_and_link_local_ranges_including_cloud_metadata() {
+        for url in [
+            "http://10.1.2.3/hook",
+            "http://172.16.0.5/hook",
+            "http://172.31.255.255/hook",
+            "http://192.168.1.1/hook",
+            // The AWS/GCP/Azure instance-metadata address: reachable only
+            // from inside the instance, and a classic SSRF target.
+            "http://169.254.169.254/latest/meta-data/",
+            "http://0.0.0.0/hook",
+            "http://[fc00::1]/hook",
+            "http://[fe80::1]/hook",
+        ] {
+            assert!(RecipientAddress::WebhookUrl(url.into()).validate().is_err(), "accepted {url}");
+        }
+    }
+
+    #[test]
+    fn webhook_does_not_reject_a_172_address_outside_the_private_range() {
+        // 172.16.0.0/12 is private; 172.32.0.0 and 172.15.0.0 are not --
+        // this pins the octet-16..=31 boundary down on both sides.
+        assert!(RecipientAddress::WebhookUrl("http://172.32.0.1/hook".into()).validate().is_ok());
+        assert!(RecipientAddress::WebhookUrl("http://172.15.255.255/hook".into()).validate().is_ok());
+    }
+
+    #[test]
+    fn webhook_accepts_an_ordinary_public_host() {
+        assert!(RecipientAddress::WebhookUrl("https://example.com/hook".into()).validate().is_ok());
+        assert!(RecipientAddress::WebhookUrl("https://8.8.8.8/hook".into()).validate().is_ok());
     }
 
     #[test]
