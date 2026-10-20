@@ -143,16 +143,16 @@ fn is_disallowed_webhook_host(host: &url::Host<&str>) -> bool {
         // then refuses to parse -- matching the already-typed `Ipv4Addr`/
         // `Ipv6Addr` the `Host` enum carries sidesteps that entirely.
         url::Host::Domain(domain) => domain.eq_ignore_ascii_case("localhost"),
-        url::Host::Ipv4(ip) => {
-            let [a, b, _, _] = ip.octets();
-            ip.is_loopback()
-                || ip.is_unspecified()
-                || a == 10
-                || (a == 172 && (16..=31).contains(&b))
-                || (a == 192 && b == 168)
-                || (a == 169 && b == 254)
-        }
+        url::Host::Ipv4(ip) => is_disallowed_ipv4(*ip),
         url::Host::Ipv6(ip) => {
+            // An IPv4-mapped IPv6 address (`::ffff:a.b.c.d`) names exactly
+            // the IPv4 address it embeds, so it has to clear the same bar
+            // -- otherwise `::ffff:169.254.169.254` walks straight past
+            // every check below under cover of being "an IPv6 address".
+            if let Some(mapped) = ip.to_ipv4_mapped() {
+                return is_disallowed_ipv4(mapped);
+            }
+
             let first = ip.segments()[0];
             ip.is_loopback()
                 || ip.is_unspecified()
@@ -160,6 +160,16 @@ fn is_disallowed_webhook_host(host: &url::Host<&str>) -> bool {
                 || (first & 0xffc0) == 0xfe80 // fe80::/10, link-local
         }
     }
+}
+
+fn is_disallowed_ipv4(ip: std::net::Ipv4Addr) -> bool {
+    let [a, b, _, _] = ip.octets();
+    ip.is_loopback()
+        || ip.is_unspecified()
+        || a == 10
+        || (a == 172 && (16..=31).contains(&b))
+        || (a == 192 && b == 168)
+        || (a == 169 && b == 254)
 }
 
 /// A notification recipient, identified by a stable id and holding one
@@ -340,6 +350,23 @@ mod tests {
         ] {
             assert!(RecipientAddress::WebhookUrl(url.into()).validate().is_err(), "accepted {url}");
         }
+    }
+
+    #[test]
+    fn webhook_rejects_ipv4_mapped_ipv6_addresses_in_the_same_disallowed_ranges() {
+        for url in [
+            "http://[::ffff:127.0.0.1]/hook",
+            "http://[::ffff:169.254.169.254]/latest/meta-data/",
+            "http://[::ffff:10.0.0.1]/hook",
+            "http://[::ffff:192.168.1.1]/hook",
+        ] {
+            assert!(RecipientAddress::WebhookUrl(url.into()).validate().is_err(), "accepted {url}");
+        }
+    }
+
+    #[test]
+    fn webhook_accepts_an_ipv4_mapped_ipv6_address_outside_any_disallowed_range() {
+        assert!(RecipientAddress::WebhookUrl("http://[::ffff:8.8.8.8]/hook".into()).validate().is_ok());
     }
 
     #[test]
