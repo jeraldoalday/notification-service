@@ -170,6 +170,12 @@ fn is_disallowed_ipv4(ip: std::net::Ipv4Addr) -> bool {
         || (a == 172 && (16..=31).contains(&b))
         || (a == 192 && b == 168)
         || (a == 169 && b == 254)
+        // 100.64.0.0/10, the RFC 6598 shared address space carriers use for
+        // CGNAT -- and, on Alibaba Cloud, exactly where the instance-metadata
+        // service answers (100.100.100.200), the same role 169.254.169.254
+        // plays on AWS/GCP/Azure. Not RFC 1918 private space, so it would
+        // otherwise walk straight past every check above.
+        || (a == 100 && (64..=127).contains(&b))
 }
 
 /// A notification recipient, identified by a stable id and holding one
@@ -344,6 +350,11 @@ mod tests {
             // The AWS/GCP/Azure instance-metadata address: reachable only
             // from inside the instance, and a classic SSRF target.
             "http://169.254.169.254/latest/meta-data/",
+            // Alibaba Cloud's equivalent, inside the RFC 6598 shared
+            // address space (100.64.0.0/10) rather than RFC 1918 space.
+            "http://100.100.100.200/latest/meta-data/",
+            "http://100.64.0.1/hook",
+            "http://100.127.255.255/hook",
             "http://0.0.0.0/hook",
             "http://[fc00::1]/hook",
             "http://[fe80::1]/hook",
@@ -375,6 +386,14 @@ mod tests {
         // this pins the octet-16..=31 boundary down on both sides.
         assert!(RecipientAddress::WebhookUrl("http://172.32.0.1/hook".into()).validate().is_ok());
         assert!(RecipientAddress::WebhookUrl("http://172.15.255.255/hook".into()).validate().is_ok());
+    }
+
+    #[test]
+    fn webhook_does_not_reject_a_100_address_outside_the_shared_address_space() {
+        // 100.64.0.0/10 is the shared address space; 100.63.255.255 and
+        // 100.128.0.0 fall just outside it on either side.
+        assert!(RecipientAddress::WebhookUrl("http://100.63.255.255/hook".into()).validate().is_ok());
+        assert!(RecipientAddress::WebhookUrl("http://100.128.0.0/hook".into()).validate().is_ok());
     }
 
     #[test]
